@@ -1,3 +1,4 @@
+import copy
 import os
 import stat
 import subprocess
@@ -19,7 +20,8 @@ ctk.set_default_color_theme("blue")
 class CheckResult:
     """Resultado de una comprobación individual."""
     def __init__(self, name: str, status: str, evidence: str = "", severity: str = "info",
-                 recommendation: str = "", can_fix: bool = False, fix_action: str = ""):
+                 recommendation: str = "", can_fix: bool = False, fix_action: str = "",
+                 manual_guidance: str = ""):
         self.name = name
         self.status = status  # "ok", "finding", "error", "unverifiable"
         self.evidence = evidence
@@ -27,18 +29,20 @@ class CheckResult:
         self.recommendation = recommendation
         self.can_fix = can_fix
         self.fix_action = fix_action
+        self.manual_guidance = manual_guidance
 
 
 class RepairAction:
     """Acción de reparación propuesta, ejecutada u omitida."""
     def __init__(self, name: str, description: str, command: str, requires_admin: bool = False,
-                 action_type: str = "", warning: str = ""):
+                 action_type: str = "", warning: str = "", manual_guidance: str = ""):
         self.name = name
         self.description = description
         self.command = command
         self.requires_admin = requires_admin
         self.action_type = action_type
         self.warning = warning
+        self.manual_guidance = manual_guidance
         self.selected = False
         self.attempted = False
         self.skipped = False
@@ -92,6 +96,33 @@ class RepairVerification:
 
 class GuardianProMaster(ctk.CTk):
     RDP_FIREWALL_GROUP = "@FirewallAPI.dll,-28752"
+    DEFENDER_MANUAL_TITLE = "ACTIVACIÓN MANUAL DE MICROSOFT DEFENDER"
+    DEFENDER_MANUAL_INTRO = (
+        "Requiere intervención manual. Guardian no modifica automáticamente la "
+        "configuración de la protección en tiempo real de Microsoft Defender. "
+        "Actívala manualmente desde Seguridad de Windows y vuelve a ejecutar el "
+        "análisis para comprobar el resultado."
+    )
+    DEFENDER_MANUAL_STEPS = (
+        "1. Abre el menú Inicio.\n"
+        "2. Busca y abre 'Seguridad de Windows' (Windows Security).\n"
+        "3. Entra en 'Protección antivirus y contra amenazas' "
+        "(Virus & threat protection).\n"
+        "4. En 'Configuración de protección antivirus y contra amenazas', "
+        "selecciona 'Administrar la configuración' (Manage settings).\n"
+        "5. Busca 'Protección en tiempo real' (Real-time protection) y cambia "
+        "el interruptor a 'Activado' (On).\n"
+        "6. Regresa a Guardian y ejecuta una nueva auditoría para verificar el estado."
+    )
+    DEFENDER_MANUAL_NOTE = (
+        "Si el interruptor está deshabilitado, no permite cambios o vuelve a "
+        "apagarse, Windows puede estar aplicando Protección contra alteraciones "
+        "(Tamper Protection), una directiva de administración u otra configuración "
+        "de antivirus. No intentes eludir esas restricciones desde Guardian. "
+        "Consulta la configuración de Seguridad de Windows o al administrador "
+        "responsable del dispositivo."
+    )
+    DEFENDER_MANUAL_DETAILS = DEFENDER_MANUAL_STEPS + "\n\n" + DEFENDER_MANUAL_NOTE
 
     def __init__(self):
         super().__init__()
@@ -107,6 +138,12 @@ class GuardianProMaster(ctk.CTk):
         self.repair_actions = []
         self.repair_actions_to_run = []
         self.sensitive_files = []
+        self.pre_repair_results = []
+        self.pre_repair_sensitive_files = []
+        self.pre_repair_timestamp = ""
+        self.pre_repair_path = ""
+        self.pre_repair_context_captured = False
+        self.post_repair_audit_attempted = False
         self.selected_path = os.path.expanduser("~")
         self.audit_timestamp = ""
         self.audit_in_progress = False
@@ -204,9 +241,22 @@ class GuardianProMaster(ctk.CTk):
 
     def elegir_carpeta(self):
         ruta = filedialog.askdirectory(initialdir=self.selected_path, title="Seleccionar carpeta para análisis de nombres de archivo")
-        if ruta:
-            self.selected_path = ruta
-            self._append_log(f"[SISTEMA] Carpeta seleccionada: {ruta}")
+        if not ruta:
+            return
+        protected_reason = self._protected_scan_reason(ruta)
+        if protected_reason:
+            self._append_log(
+                f"[RECHAZADA] No se permite analizar directamente {ruta}: {protected_reason}.",
+                "error"
+            )
+            messagebox.showwarning(
+                "Carpeta protegida",
+                f"Guardian Pro no analiza directamente {ruta} porque es {protected_reason}.\n\n"
+                "Seleccione una carpeta de usuario o una carpeta de pruebas."
+            )
+            return
+        self.selected_path = ruta
+        self._append_log(f"[SISTEMA] Carpeta seleccionada: {ruta}")
 
     def _append_log(self, text: str, tag: str | None = None):
         """Añade texto al área de resultados (siempre desde el hilo principal)."""
@@ -236,17 +286,28 @@ class GuardianProMaster(ctk.CTk):
         for key, label in self.summary_labels.items():
             label.configure(text=str(counts.get(key, 0)))
 
-    def _reset_audit_state(self):
+    def _reset_audit_state(self, preserve_repair_context: bool = False):
         """Inicializa de forma única el estado de una auditoría nueva.
 
         No toca `audit_in_progress` ni `repair_in_progress`: el ciclo de vida
         de una operación activa lo controlan el worker y sus finalizadores.
+
+        Con `preserve_repair_context=True` se conserva el estado inicial y el
+        historial de acciones para la reauditoría automática posterior a una
+        reparación. Una auditoría nueva independiente limpia todo el contexto.
         """
         self.check_results = []
-        self.repair_actions = []
         self.repair_actions_to_run = []
         self.sensitive_files = []
         self.audit_timestamp = ""
+        if not preserve_repair_context:
+            self.repair_actions = []
+            self.pre_repair_results = []
+            self.pre_repair_sensitive_files = []
+            self.pre_repair_timestamp = ""
+            self.pre_repair_path = ""
+            self.pre_repair_context_captured = False
+            self.post_repair_audit_attempted = False
         # Evitar que eventos de una operación anterior se interpreten como
         # resultados de la auditoría nueva. Solo se llama sin operaciones activas.
         while True:
@@ -255,6 +316,18 @@ class GuardianProMaster(ctk.CTk):
             except queue.Empty:
                 break
         self._update_summary_counts()
+
+    def _capture_repair_context(self):
+        """Guarda una copia independiente del estado previo a la reparación."""
+        if not self.pre_repair_context_captured:
+            self.pre_repair_results = copy.deepcopy(self.check_results)
+            self.pre_repair_sensitive_files = list(self.sensitive_files)
+            self.pre_repair_timestamp = self.audit_timestamp
+            self.pre_repair_path = self.selected_path
+            self.pre_repair_context_captured = True
+        # Un nuevo lote invalida la reauditoría anterior hasta que se ejecute
+        # otra reauditoría posterior.
+        self.post_repair_audit_attempted = False
 
     # ==================== UTILIDADES DE ESTADO ====================
 
@@ -269,6 +342,52 @@ class GuardianProMaster(ctk.CTk):
         except Exception as exc:
             print(f"[Guardian] No se pudo comprobar el privilegio de administrador: {exc}", file=sys.stderr)
             return False
+
+    @staticmethod
+    def _normalize_path_for_compare(path: str) -> str:
+        """Normaliza una ruta de Windows para comparaciones seguras."""
+        if not path:
+            return ""
+        try:
+            expanded = os.path.expandvars(os.path.expanduser(str(path)))
+            return os.path.normcase(os.path.normpath(os.path.abspath(expanded)))
+        except (OSError, ValueError):
+            return ""
+
+    @classmethod
+    def _protected_scan_reason(cls, path: str) -> str:
+        """Devuelve el motivo por el que una raíz no debe escanearse, o ''."""
+        candidate = cls._normalize_path_for_compare(path)
+        if not candidate:
+            return ""
+
+        drive, tail = os.path.splitdrive(candidate)
+        # Solo la raíz de la unidad es demasiado amplia; sus subcarpetas de
+        # usuario sí pueden analizarse.
+        if drive and not drive.startswith("\\\\") and tail in ("", os.sep):
+            return f"la raíz completa de la unidad {drive}\\"
+
+        env_roots = (
+            ("SystemRoot", "carpeta del sistema"),
+            ("WINDIR", "carpeta del sistema"),
+            ("ProgramFiles", "directorio de instalación de aplicaciones"),
+            ("ProgramFiles(x86)", "directorio de instalación de aplicaciones"),
+            ("ProgramW6432", "directorio de instalación de aplicaciones"),
+            ("ProgramData", "directorio de datos de sistema"),
+        )
+        for env_name, label in env_roots:
+            value = os.environ.get(env_name)
+            if not value:
+                continue
+            root = cls._normalize_path_for_compare(value)
+            if not root:
+                continue
+            # La comparación exige el separador de ruta para no confundir
+            # C:\Windows con C:\WindowsBackup.
+            if candidate == root or candidate.startswith(root + os.sep):
+                return f"{label} {value}"
+
+        return ""
 
     @staticmethod
     def _enabled_state(value) -> str:
@@ -417,13 +536,13 @@ class GuardianProMaster(ctk.CTk):
             detail += f" | Habilitadas: {shown}"
         return detail
 
-    def iniciar_auditoria(self):
+    def iniciar_auditoria(self, preserve_repair_context: bool = False):
         if self.audit_in_progress or self.repair_in_progress:
             return
 
         # Inicializar el estado antes de marcar la operación como activa. Si el
         # reset falla, no dejamos la auditoría bloqueada.
-        self._reset_audit_state()
+        self._reset_audit_state(preserve_repair_context=preserve_repair_context)
         self.audit_in_progress = True
 
         try:
@@ -529,7 +648,9 @@ class GuardianProMaster(ctk.CTk):
 
         self.btn_audit.configure(state="normal", text="🔍  Iniciar auditoría")
         self.btn_select_folder.configure(state="normal")
-        self.btn_report.configure(state="normal" if self.check_results else "disabled")
+        self.btn_report.configure(
+            state="normal" if (self.check_results or self.pre_repair_context_captured) else "disabled"
+        )
         self.btn_new_audit.configure(state="normal")
 
         # Habilitar reparación solo si hay hallazgos reparables
@@ -562,6 +683,10 @@ class GuardianProMaster(ctk.CTk):
         self.txt_results.insert("end", f"{result.evidence}\n", "dim")
         if result.recommendation:
             self.txt_results.insert("end", f"      → {result.recommendation}\n", "dim")
+        if result.manual_guidance:
+            for line in result.manual_guidance.splitlines():
+                prefix = "        " if line.strip() else ""
+                self.txt_results.insert("end", f"{prefix}{line}\n", "dim")
         self.txt_results.see("end")
         self.txt_results.configure(state="disabled")
 
@@ -610,39 +735,112 @@ class GuardianProMaster(ctk.CTk):
                 recommendation="Ejecute la aplicación como administrador o verifique manualmente."
             )))
 
+    @staticmethod
+    def _defender_bool(value):
+        """Convierte un valor booleano de PowerShell sin usar verdad simple."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            if value == 1:
+                return True
+            if value == 0:
+                return False
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1"}:
+                return True
+            if normalized in {"false", "0"}:
+                return False
+        return None
+
+    @classmethod
+    def _defender_status_evidence(cls, status: dict) -> str:
+        """Resume el estado real y los diagnósticos disponibles de Defender."""
+        def label(value, true_text, false_text):
+            parsed = cls._defender_bool(value)
+            if parsed is True:
+                return true_text
+            if parsed is False:
+                return false_text
+            return "No disponible"
+
+        mode = status.get("AMRunningMode")
+        mode_text = str(mode).strip() if mode not in (None, "") else "No disponible"
+        return " | ".join((
+            f"Protección en tiempo real: {label(status.get('RealTimeProtectionEnabled'), 'Habilitada', 'Deshabilitada')}",
+            f"Tamper Protection: {label(status.get('IsTamperProtected'), 'Activada', 'Desactivada')}",
+            f"Antivirus: {label(status.get('AntivirusEnabled'), 'Habilitado', 'Deshabilitado')}",
+            f"AMRunningMode: {mode_text}",
+            f"Preferencia DisableRealtimeMonitoring: {label(status.get('DisableRealtimeMonitoring'), 'Sí', 'No')}",
+        ))
+
+    def _query_defender_status(self) -> dict:
+        """Consulta estado y diagnósticos de Defender con errores controlados."""
+        script = (
+            "$status = Get-MpComputerStatus -ErrorAction Stop; "
+            "$pref = $null; "
+            "try { $pref = Get-MpPreference -ErrorAction Stop } catch { }; "
+            "[pscustomobject]@{"
+            "RealTimeProtectionEnabled = $status.RealTimeProtectionEnabled; "
+            "IsTamperProtected = $status.IsTamperProtected; "
+            "AntivirusEnabled = $status.AntivirusEnabled; "
+            "AMRunningMode = [string]$status.AMRunningMode; "
+            "DisableRealtimeMonitoring = $(if ($null -ne $pref) { $pref.DisableRealtimeMonitoring } else { $null })"
+            "} | ConvertTo-Json -Compress"
+        )
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True, text=True, timeout=15, encoding='utf-8', errors='ignore'
+        )
+        if proc.returncode != 0:
+            detail = proc.stderr.strip() or "sin detalle"
+            raise RuntimeError(f"PowerShell falló (código {proc.returncode}): {detail}")
+        text = proc.stdout.strip()
+        if not text:
+            raise ValueError("salida vacía")
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"JSON inválido: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError("formato de estado de Defender inesperado")
+        return data
+
     def _check_defender(self):
         """Comprueba la protección en tiempo real de Microsoft Defender."""
         try:
-            cmd = [
-                "powershell", "-NoProfile", "-Command",
-                "(Get-MpComputerStatus).RealTimeProtectionEnabled"
-            ]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15, encoding='utf-8', errors='ignore')
+            status = self._query_defender_status()
+            evidence = self._defender_status_evidence(status)
+            realtime = self._defender_bool(status.get("RealTimeProtectionEnabled"))
 
-            if proc.returncode != 0:
-                raise RuntimeError(f"PowerShell falló (código {proc.returncode}): {proc.stderr.strip()}")
-
-            output = proc.stdout.strip()
-            if output.lower() == "true":
+            if realtime is True:
                 self.result_queue.put(("result", CheckResult(
                     name="Microsoft Defender",
                     status="ok",
-                    evidence="Protección en tiempo real: Habilitada",
+                    evidence=evidence,
                     severity="info",
                     recommendation="La protección en tiempo real está activa."
                 )))
-            elif output.lower() == "false":
+            elif realtime is False:
                 self.result_queue.put(("result", CheckResult(
                     name="Microsoft Defender",
                     status="finding",
-                    evidence="Protección en tiempo real: Deshabilitada",
+                    evidence=evidence,
                     severity="high",
-                    recommendation="Active la protección en tiempo real de Windows Defender.",
-                    can_fix=True,
-                    fix_action="defender_enable_rtp"
+                    recommendation=self.DEFENDER_MANUAL_INTRO,
+                    manual_guidance=self.DEFENDER_MANUAL_DETAILS
                 )))
             else:
-                raise ValueError(f"Respuesta inesperada: {output}")
+                self.result_queue.put(("result", CheckResult(
+                    name="Microsoft Defender",
+                    status="unverifiable",
+                    evidence=evidence,
+                    severity="info",
+                    recommendation=(
+                        "No se pudo confirmar el estado de la protección en tiempo real. "
+                        "Verifique manualmente con 'Get-MpComputerStatus'."
+                    )
+                )))
 
         except subprocess.TimeoutExpired:
             self.result_queue.put(("result", CheckResult(
@@ -794,6 +992,18 @@ class GuardianProMaster(ctk.CTk):
                 recommendation=recommendation,
                 can_fix=False
             )))
+
+        # Rechazar ubicaciones protegidas antes de cualquier acceso al sistema
+        # de archivos. Esto evita recorrer C:\Windows o una raíz de unidad.
+        protected_reason = self._protected_scan_reason(root_path) if root_path else ""
+        if protected_reason:
+            publish_result(
+                "error",
+                f"Ruta bloqueada antes del recorrido: {root_path} es {protected_reason}.",
+                "Seleccione una carpeta de usuario o una carpeta de pruebas. "
+                "No se recorrió la ubicación protegida ni se generaron hallazgos de archivos."
+            )
+            return
 
         # Validar la raíz antes de recorrer: distingue ruta inexistente,
         # archivo en lugar de carpeta y falta de permisos.
@@ -966,15 +1176,9 @@ class GuardianProMaster(ctk.CTk):
                     action_type="firewall_enable_all",
                     warning="Puede bloquear aplicaciones o servicios que dependan de reglas de firewall existentes."
                 ))
-            elif r.fix_action == "defender_enable_rtp":
-                actions.append(RepairAction(
-                    name="Activar protección en tiempo real de Defender",
-                    description="Habilita la protección en tiempo real de Microsoft Defender.",
-                    command="Set-MpPreference -DisableRealtimeMonitoring 0",
-                    requires_admin=True,
-                    action_type="defender_enable_rtp",
-                    warning="Puede afectar el rendimiento. Requiere que Microsoft Defender esté instalado y disponible."
-                ))
+            # Microsoft Defender se comprueba, pero no se repara automáticamente:
+            # Windows puede bloquear el cambio por Tamper Protection o una
+            # directiva. La corrección es una guía manual y una nueva auditoría.
             elif r.fix_action == "rdp_disable":
                 rdp_command = (
                     "Set-ItemProperty -Path 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server' "
@@ -1037,7 +1241,12 @@ class GuardianProMaster(ctk.CTk):
 
         actions = self._build_repair_actions()
         if not actions:
-            messagebox.showinfo("Guardian Pro", "No hay hallazgos que puedan repararse automáticamente.")
+            messagebox.showinfo(
+                "Guardian Pro",
+                "No hay hallazgos que puedan repararse automáticamente. "
+                "Si Microsoft Defender requiere activación manual, siga las "
+                "instrucciones mostradas en los resultados."
+            )
             return
 
         # Preservar el historial de esta auditoría: abrir el diálogo no debe
@@ -1069,6 +1278,8 @@ class GuardianProMaster(ctk.CTk):
             if not action.selected:
                 self._append_log(f"  — OMITIDA: {action.name} ({action.skip_reason})", "dim")
 
+        # Conservar el estado que originó este lote antes de ejecutar nada.
+        self._capture_repair_context()
         self.repair_actions_to_run = selected
 
         # Ejecutar solo las acciones aceptadas, en hilo secundario.
@@ -1131,6 +1342,11 @@ class GuardianProMaster(ctk.CTk):
                     action.verified = verification.status == "verified"
                     action.verification_status = verification.status
                     action.verification_evidence = verification.evidence
+                    if (action.manual_guidance and not action.verified
+                            and action.manual_guidance not in action.verification_evidence):
+                        action.verification_evidence = (
+                            f"{action.verification_evidence} {action.manual_guidance}"
+                        ).strip()
                 else:
                     action.verified = False
                     action.verification_status = "not_checked"
@@ -1151,12 +1367,12 @@ class GuardianProMaster(ctk.CTk):
         Private y Public, y los tres con Enabled=True/1. 0/False y 2
         (NotConfigured) no cuentan como habilitado; un enum desconocido es error.
 
-        defender_enable_rtp: consulta con código 0 y
-        RealTimeProtectionEnabled=True.
-
         rdp_disable: consulta con código 0 de fDenyTSConnections=1 y consulta
         con código 0 de reglas RDP por Group sin ninguna Enabled=True/1. 2
         cuenta como deshabilitada. Cualquier error de consulta es error.
+
+        Microsoft Defender no forma parte del mecanismo de reparación: su
+        corrección es manual y se verifica con una nueva auditoría.
         """
         if not action.success:
             return RepairVerification("not_checked", "No se verificó porque la ejecución del comando falló.")
@@ -1168,22 +1384,6 @@ class GuardianProMaster(ctk.CTk):
                 if all(state == "enabled" for state in profiles.values()):
                     return RepairVerification("verified", evidence)
                 return RepairVerification("unverified", evidence)
-
-            if action.action_type == "defender_enable_rtp":
-                cmd = [
-                    "powershell", "-NoProfile", "-Command",
-                    "(Get-MpComputerStatus).RealTimeProtectionEnabled"
-                ]
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10, encoding='utf-8', errors='ignore')
-                if proc.returncode != 0:
-                    detail = proc.stderr.strip() or "sin detalle"
-                    return RepairVerification("error", f"PowerShell falló (código {proc.returncode}): {detail}")
-                value = proc.stdout.strip().lower()
-                if value == "true":
-                    return RepairVerification("verified", "RealTimeProtectionEnabled=True")
-                if value == "false":
-                    return RepairVerification("unverified", "RealTimeProtectionEnabled=False")
-                return RepairVerification("error", f"Respuesta inesperada: {value!r}")
 
             if action.action_type == "rdp_disable":
                 cmd = [
@@ -1265,13 +1465,15 @@ class GuardianProMaster(ctk.CTk):
         )
         self.btn_audit.configure(state="normal")
         self.btn_new_audit.configure(state="normal")
-        self.btn_report.configure(state="normal" if self.check_results else "disabled")
+        self.btn_report.configure(
+            state="normal" if (self.check_results or self.pre_repair_context_captured) else "disabled"
+        )
         self.btn_select_folder.configure(state="normal")
 
         # Re-escanear solo si al menos una acción del lote actual llegó a ejecutarse.
         if any(a.attempted for a in current_actions):
             if messagebox.askyesno("Guardian Pro", "Reparaciones completadas. ¿Desea realizar una nueva auditoría para verificar los cambios?"):
-                self.nueva_auditoria(auto_start=True)
+                self.nueva_auditoria(auto_start=True, preserve_repair_context=True)
 
     # ==================== INFORME PDF ====================
 
@@ -1294,8 +1496,141 @@ class GuardianProMaster(ctk.CTk):
         pdf.set_x(pdf.l_margin)
         pdf.multi_cell(0, height, text)
 
+    @staticmethod
+    def _pdf_section_title(pdf, title: str):
+        pdf.ln(2)
+        pdf.set_font("Helvetica", 'B', 13)
+        pdf.set_text_color(0, 0, 0)
+        pdf.cell(0, 8, GuardianProMaster._pdf_safe(title), ln=True)
+        pdf.ln(1)
+
+    def _pdf_add_scope(self, pdf, path: str):
+        pdf.set_font("Helvetica", '', 10)
+        self._pdf_multicell(pdf, self._pdf_safe(
+            f"  Alcance del análisis de archivos: {path or 'No seleccionado'}"
+        ), 5)
+        self._pdf_multicell(pdf, self._pdf_safe(
+            "  El alcance indica la carpeta seleccionada. Si la comprobación de archivos reporta "
+            "errores de acceso o de recorrido, el análisis no cubrió la carpeta completa."
+        ), 5)
+        pdf.ln(2)
+
+    def _pdf_add_summary(self, pdf, results: list):
+        counts = {"ok": 0, "finding": 0, "unverifiable": 0, "error": 0}
+        for r in results:
+            if r.status in counts:
+                counts[r.status] += 1
+
+        pdf.set_font("Helvetica", '', 10)
+        pdf.set_text_color(0, 0, 0)
+        pdf.cell(0, 6, self._pdf_safe(f"  Correctas: {counts['ok']}"), ln=True)
+        pdf.set_text_color(200, 0, 0)
+        pdf.cell(0, 6, self._pdf_safe(f"  Hallazgos: {counts['finding']}"), ln=True)
+        pdf.set_text_color(200, 150, 0)
+        pdf.cell(0, 6, self._pdf_safe(f"  No verificables: {counts['unverifiable']}"), ln=True)
+        pdf.set_text_color(200, 0, 0)
+        pdf.cell(0, 6, self._pdf_safe(f"  Errores: {counts['error']}"), ln=True)
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(4)
+
+    def _pdf_add_check_details(self, pdf, results: list):
+        for r in results:
+            pdf.set_font("Helvetica", 'B', 10)
+            status_text = {
+                "ok": "OK", "finding": "HALLAZGO", "unverifiable": "NO VERIFICABLE", "error": "ERROR"
+            }.get(r.status, r.status.upper())
+            pdf.cell(0, 6, self._pdf_safe(f"{r.name} — {status_text}"), ln=True)
+
+            pdf.set_font("Helvetica", '', 9)
+            pdf.set_text_color(80, 80, 80)
+            self._pdf_multicell(pdf, self._pdf_safe(f"  Evidencia: {r.evidence}"), 5)
+            if r.recommendation:
+                self._pdf_multicell(pdf, self._pdf_safe(f"  Recomendación: {r.recommendation}"), 5)
+            pdf.set_text_color(0, 0, 0)
+            pdf.ln(3)
+
+    @staticmethod
+    def _has_defender_finding(results: list) -> bool:
+        return any(
+            r.name == "Microsoft Defender" and r.status == "finding"
+            for r in results
+        )
+
+    def _pdf_add_defender_manual_guidance(self, pdf, results: list, state_label="estado inicial"):
+        """Añade la guía manual solo cuando Defender aparece como hallazgo."""
+        defender = next((
+            r for r in results
+            if r.name == "Microsoft Defender" and r.status == "finding"
+        ), None)
+        if defender is None:
+            return
+
+        self._pdf_section_title(pdf, self.DEFENDER_MANUAL_TITLE)
+        pdf.set_font("Helvetica", '', 9)
+        pdf.set_text_color(80, 80, 80)
+        self._pdf_multicell(pdf, self._pdf_safe(
+            f"  Qué se detectó en el {state_label}: la protección en tiempo real de "
+            "Microsoft Defender está desactivada."
+        ), 5)
+        if defender.evidence:
+            self._pdf_multicell(pdf, self._pdf_safe(f"  Evidencia: {defender.evidence}"), 5)
+        self._pdf_multicell(pdf, self._pdf_safe(f"  {self.DEFENDER_MANUAL_INTRO}"), 5)
+        self._pdf_multicell(pdf, self._pdf_safe(
+            "  Pasos para activarla manualmente:"
+        ), 5)
+        self._pdf_multicell(pdf, self._pdf_safe(self.DEFENDER_MANUAL_STEPS), 5)
+        self._pdf_multicell(pdf, self._pdf_safe(
+            "  Después de activarla, vuelve a ejecutar una auditoría en Guardian "
+            "para verificar el estado."
+        ), 5)
+        self._pdf_multicell(pdf, self._pdf_safe(f"  {self.DEFENDER_MANUAL_NOTE}"), 5)
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(2)
+
+    def _pdf_add_sensitive_files(self, pdf, files: list, title: str):
+        if not files:
+            return
+        self._pdf_section_title(pdf, title)
+        pdf.set_font("Helvetica", '', 8)
+        pdf.set_text_color(80, 80, 80)
+        for file_path in files[:50]:
+            self._pdf_multicell(pdf, self._pdf_safe(f"  > {file_path}"), 4.5)
+        if len(files) > 50:
+            self._pdf_multicell(
+                pdf, self._pdf_safe(f"  ... y {len(files) - 50} archivos más."), 4.5
+            )
+        pdf.set_text_color(0, 0, 0)
+
+    def _pdf_add_repair_history(self, pdf, title: str):
+        repair_history = [
+            a for a in self.repair_actions
+            if a.attempted or a.skipped or a.selected or a.verification_status == "permission_denied"
+        ]
+        if not repair_history:
+            return
+        self._pdf_section_title(pdf, title)
+        for a in repair_history:
+            pdf.set_font("Helvetica", 'B', 10)
+            pdf.cell(0, 6, self._pdf_safe(f"{a.name} — {a.result_label()}"), ln=True)
+            pdf.set_font("Helvetica", '', 9)
+            pdf.set_text_color(80, 80, 80)
+            command_label = "Comando" if a.attempted else "Comando propuesto"
+            self._pdf_multicell(pdf, self._pdf_safe(f"  {command_label}: {a.command}"), 5)
+            if a.skip_reason:
+                self._pdf_multicell(pdf, self._pdf_safe(f"  Motivo: {a.skip_reason}"), 5)
+            if a.output:
+                self._pdf_multicell(pdf, self._pdf_safe(f"  Salida: {a.output}"), 5)
+            if a.error:
+                self._pdf_multicell(pdf, self._pdf_safe(f"  Error: {a.error}"), 5)
+            if a.verification_evidence:
+                self._pdf_multicell(pdf, self._pdf_safe(f"  Verificación: {a.verification_evidence}"), 5)
+            if a.manual_guidance and a.manual_guidance not in a.verification_evidence:
+                self._pdf_multicell(pdf, self._pdf_safe(f"  Guía: {a.manual_guidance}"), 5)
+            pdf.set_text_color(0, 0, 0)
+            pdf.ln(3)
+
     def crear_pdf(self):
-        if not self.check_results:
+        if not self.check_results and not self.pre_repair_context_captured:
             messagebox.showwarning("Guardian Pro", "No hay resultados de auditoría para generar el informe.")
             return
 
@@ -1321,101 +1656,69 @@ class GuardianProMaster(ctk.CTk):
             pdf.cell(0, 10, self._pdf_safe("Guardian Pro — Informe de Seguridad"), ln=True, align='C')
             pdf.set_font("Helvetica", '', 10)
             pdf.cell(0, 6, self._pdf_safe(f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"), ln=True, align='C')
-            pdf.cell(0, 6, self._pdf_safe(f"Auditoría: {self.audit_timestamp}"), ln=True, align='C')
+            if self.pre_repair_context_captured:
+                pdf.cell(0, 6, self._pdf_safe(
+                    f"Auditoría inicial: {self.pre_repair_timestamp or 'No disponible'}"
+                ), ln=True, align='C')
+                post_label = self.audit_timestamp if self.post_repair_audit_attempted else "no realizada"
+                pdf.cell(0, 6, self._pdf_safe(f"Reauditoría posterior: {post_label or 'sin resultados'}"), ln=True, align='C')
+            else:
+                pdf.cell(0, 6, self._pdf_safe(f"Auditoría: {self.audit_timestamp}"), ln=True, align='C')
             pdf.ln(10)
 
-            # Resumen
-            pdf.set_text_color(0, 0, 0)
-            pdf.set_font("Helvetica", 'B', 13)
-            pdf.cell(0, 8, self._pdf_safe("1. Resumen de comprobaciones"), ln=True)
-            pdf.set_font("Helvetica", '', 10)
+            if not self.pre_repair_context_captured:
+                # Formato ordinario: auditoría sin ciclo de reparación.
+                self._pdf_section_title(pdf, "1. Resumen de comprobaciones")
+                self._pdf_add_scope(pdf, self.selected_path)
+                self._pdf_add_summary(pdf, self.check_results)
 
-            # Alcance explícito del análisis de archivos.
-            self._pdf_multicell(pdf, self._pdf_safe(
-                f"  Alcance del análisis de archivos: {self.selected_path or 'No seleccionado'}"
-            ), 5)
-            self._pdf_multicell(pdf, self._pdf_safe(
-                "  El alcance indica la carpeta seleccionada. Si la comprobación de archivos reporta "
-                "errores de acceso o de recorrido, el análisis no cubrió la carpeta completa."
-            ), 5)
-            pdf.ln(2)
+                self._pdf_section_title(pdf, "2. Detalle de comprobaciones")
+                self._pdf_add_check_details(pdf, self.check_results)
+                self._pdf_add_defender_manual_guidance(pdf, self.check_results)
+                self._pdf_add_repair_history(pdf, "3. Reparaciones y acciones omitidas")
+                self._pdf_add_sensitive_files(
+                    pdf, self.sensitive_files,
+                    "4. Archivos con nombres sensibles (solo nombres, no contenido)"
+                )
+            else:
+                # Ciclo de corrección: estado inicial, acciones y estado posterior.
+                self._pdf_section_title(pdf, "1. Estado inicial (antes de la reparación)")
+                self._pdf_add_scope(pdf, self.pre_repair_path)
+                self._pdf_add_summary(pdf, self.pre_repair_results)
+                self._pdf_add_check_details(pdf, self.pre_repair_results)
+                self._pdf_add_defender_manual_guidance(
+                    pdf, self.pre_repair_results, "estado inicial"
+                )
+                self._pdf_add_sensitive_files(
+                    pdf, self.pre_repair_sensitive_files,
+                    "Archivos sensibles en el estado inicial (solo nombres, no contenido)"
+                )
 
-            counts = {"ok": 0, "finding": 0, "unverifiable": 0, "error": 0}
-            for r in self.check_results:
-                if r.status in counts:
-                    counts[r.status] += 1
+                self._pdf_add_repair_history(pdf, "2. Acciones de corrección")
 
-            pdf.cell(0, 6, self._pdf_safe(f"  Correctas: {counts['ok']}"), ln=True)
-            pdf.set_text_color(200, 0, 0)
-            pdf.cell(0, 6, self._pdf_safe(f"  Hallazgos: {counts['finding']}"), ln=True)
-            pdf.set_text_color(200, 150, 0)
-            pdf.cell(0, 6, self._pdf_safe(f"  No verificables: {counts['unverifiable']}"), ln=True)
-            pdf.set_text_color(200, 0, 0)
-            pdf.cell(0, 6, self._pdf_safe(f"  Errores: {counts['error']}"), ln=True)
-            pdf.set_text_color(0, 0, 0)
-            pdf.ln(4)
-
-            # Detalle de comprobaciones
-            pdf.set_font("Helvetica", 'B', 13)
-            pdf.cell(0, 8, self._pdf_safe("2. Detalle de comprobaciones"), ln=True)
-            pdf.ln(2)
-
-            for r in self.check_results:
-                pdf.set_font("Helvetica", 'B', 10)
-                status_text = {"ok": "OK", "finding": "HALLAZGO", "unverifiable": "NO VERIFICABLE", "error": "ERROR"}.get(r.status, r.status.upper())
-                pdf.cell(0, 6, self._pdf_safe(f"{r.name} — {status_text}"), ln=True)
-
-                pdf.set_font("Helvetica", '', 9)
-                pdf.set_text_color(80, 80, 80)
-                # Todo el texto se adapta a la fuente core del PDF.
-                self._pdf_multicell(pdf, self._pdf_safe(f"  Evidencia: {r.evidence}"), 5)
-                if r.recommendation:
-                    self._pdf_multicell(pdf, self._pdf_safe(f"  Recomendación: {r.recommendation}"), 5)
-                pdf.set_text_color(0, 0, 0)
-                pdf.ln(3)
-
-            # Reparaciones ejecutadas y acciones omitidas
-            repair_history = [
-                a for a in self.repair_actions
-                if a.attempted or a.skipped or a.selected or a.verification_status == "permission_denied"
-            ]
-            if repair_history:
-                pdf.ln(2)
-                pdf.set_font("Helvetica", 'B', 13)
-                pdf.cell(0, 8, self._pdf_safe("3. Reparaciones y acciones omitidas"), ln=True)
-                pdf.ln(2)
-
-                for a in repair_history:
-                    pdf.set_font("Helvetica", 'B', 10)
-                    pdf.cell(0, 6, self._pdf_safe(f"{a.name} — {a.result_label()}"), ln=True)
-                    pdf.set_font("Helvetica", '', 9)
-                    pdf.set_text_color(80, 80, 80)
-                    command_label = "Comando" if a.attempted else "Comando propuesto"
-                    self._pdf_multicell(pdf, self._pdf_safe(f"  {command_label}: {a.command}"), 5)
-                    if a.skip_reason:
-                        self._pdf_multicell(pdf, self._pdf_safe(f"  Motivo: {a.skip_reason}"), 5)
-                    if a.output:
-                        self._pdf_multicell(pdf, self._pdf_safe(f"  Salida: {a.output}"), 5)
-                    if a.error:
-                        self._pdf_multicell(pdf, self._pdf_safe(f"  Error: {a.error}"), 5)
-                    if a.verification_evidence:
-                        self._pdf_multicell(pdf, self._pdf_safe(f"  Verificación: {a.verification_evidence}"), 5)
-                    pdf.set_text_color(0, 0, 0)
-                    pdf.ln(3)
-
-            # Archivos sensibles
-            if self.sensitive_files:
-                pdf.ln(2)
-                pdf.set_font("Helvetica", 'B', 13)
-                pdf.cell(0, 8, self._pdf_safe("4. Archivos con nombres sensibles (solo nombres, no contenido)"), ln=True)
-                pdf.ln(2)
-                pdf.set_font("Helvetica", '', 8)
-                pdf.set_text_color(80, 80, 80)
-                for f in self.sensitive_files[:50]:  # Limitar a 50 para no saturar
-                    self._pdf_multicell(pdf, self._pdf_safe(f"  > {f}"), 4.5)
-                if len(self.sensitive_files) > 50:
-                    self._pdf_multicell(pdf, self._pdf_safe(f"  ... y {len(self.sensitive_files) - 50} archivos más."), 4.5)
-                pdf.set_text_color(0, 0, 0)
+                self._pdf_section_title(pdf, "3. Estado posterior (reauditoría)")
+                if self.post_repair_audit_attempted and self.check_results:
+                    self._pdf_add_scope(pdf, self.selected_path)
+                    self._pdf_add_summary(pdf, self.check_results)
+                    self._pdf_add_check_details(pdf, self.check_results)
+                    if not self._has_defender_finding(self.pre_repair_results):
+                        self._pdf_add_defender_manual_guidance(
+                            pdf, self.check_results, "estado posterior"
+                        )
+                    self._pdf_add_sensitive_files(
+                        pdf, self.sensitive_files,
+                        "Archivos sensibles en el estado posterior (solo nombres, no contenido)"
+                    )
+                elif self.post_repair_audit_attempted:
+                    self._pdf_multicell(pdf, self._pdf_safe(
+                        "  La reauditoría se intentó pero no produjo resultados. "
+                        "El estado posterior no está verificado."
+                    ), 5)
+                else:
+                    self._pdf_multicell(pdf, self._pdf_safe(
+                        "  No se realizó una reauditoría posterior. "
+                        "El estado actual no está verificado en este informe."
+                    ), 5)
 
             # Pie de página con privacidad y advertencia
             pdf.ln(6)
@@ -1439,11 +1742,13 @@ class GuardianProMaster(ctk.CTk):
 
     # ==================== ESTADO Y LIMPIEZA ====================
 
-    def nueva_auditoria(self, auto_start=False):
-        """Resetea el estado para una nueva auditoría."""
+    def nueva_auditoria(self, auto_start=False, preserve_repair_context=False):
+        """Resetea el estado para una nueva auditoría o reauditoría posterior."""
         if self.audit_in_progress or self.repair_in_progress:
             return
-        self._reset_audit_state()
+        self._reset_audit_state(preserve_repair_context=preserve_repair_context)
+        if preserve_repair_context:
+            self.post_repair_audit_attempted = True
         self._clear_results()
         self.progress_bar.set(0)
         self.progress_bar.configure(mode="determinate")
@@ -1453,12 +1758,15 @@ class GuardianProMaster(ctk.CTk):
         self.btn_report.configure(state="disabled")
         self.btn_new_audit.configure(state="normal")
         self.btn_select_folder.configure(state="normal")
-        self._append_log("=== Guardian Pro — Nueva auditoría ===")
+        if preserve_repair_context:
+            self._append_log("=== Guardian Pro — Reauditoría posterior a reparaciones ===")
+        else:
+            self._append_log("=== Guardian Pro — Nueva auditoría ===")
         self._append_log(f"Carpeta seleccionada: {self.selected_path}")
         self._append_log("")
 
         if auto_start:
-            self.iniciar_auditoria()
+            self.iniciar_auditoria(preserve_repair_context=preserve_repair_context)
 
 
 if __name__ == "__main__":

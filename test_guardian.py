@@ -14,7 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
-from subprocess import CompletedProcess
+from subprocess import CompletedProcess, TimeoutExpired
 from unittest.mock import patch
 
 import Guardian
@@ -287,6 +287,108 @@ class FileScanTests(GuardianGuiTestCase):
             self.assertTrue(any("password.txt" in path for path in self.app.sensitive_files))
 
 
+class ProtectedPathTests(GuardianGuiTestCase):
+    PROTECTED_ENV = {
+        "SystemRoot": r"C:\Windows",
+        "WINDIR": r"C:\Windows",
+        "ProgramFiles": r"C:\Program Files",
+        "ProgramFiles(x86)": r"C:\Program Files (x86)",
+        "ProgramW6432": r"C:\Program Files",
+        "ProgramData": r"C:\ProgramData",
+    }
+
+    def test_system_and_program_paths_are_rejected(self):
+        with patch.dict("Guardian.os.environ", self.PROTECTED_ENV, clear=False):
+            for path in (
+                r"C:\Windows",
+                r"C:\Windows\System32",
+                r"C:\Program Files\Aplicacion",
+                r"C:\Program Files (x86)\Aplicacion",
+                r"C:\ProgramData\Aplicacion",
+            ):
+                with self.subTest(path=path):
+                    reason = self.app._protected_scan_reason(path)
+                    self.assertTrue(reason)
+                    self.assertTrue(any(word in reason.lower() for word in ("carpeta", "directorio")))
+
+    def test_drive_root_is_rejected_but_not_all_its_subfolders(self):
+        with patch.dict("Guardian.os.environ", self.PROTECTED_ENV, clear=False):
+            self.assertIn("unidad", self.app._protected_scan_reason("C:\\"))
+            self.assertEqual(self.app._protected_scan_reason(r"C:\Users\Persona"), "")
+
+    def test_similar_prefix_is_not_blocked(self):
+        with patch.dict("Guardian.os.environ", self.PROTECTED_ENV, clear=False):
+            self.assertEqual(self.app._protected_scan_reason(r"C:\WindowsBackup"), "")
+            self.assertEqual(self.app._protected_scan_reason(r"C:\Program Files Backup"), "")
+            self.assertEqual(self.app._protected_scan_reason(r"C:\ProgramDataBackup"), "")
+
+    def test_protected_path_comparison_is_case_insensitive(self):
+        with patch.dict("Guardian.os.environ", self.PROTECTED_ENV, clear=False):
+            self.assertTrue(self.app._protected_scan_reason(r"c:\windows\system32"))
+            self.assertTrue(self.app._protected_scan_reason(r"C:/PROGRAM FILES/App"))
+
+    def test_protected_root_is_blocked_before_walk_or_stat(self):
+        with patch.dict("Guardian.os.environ", self.PROTECTED_ENV, clear=False), \
+             patch("Guardian.os.walk") as walk, \
+             patch("Guardian.os.stat") as stat, \
+             patch("Guardian.os.scandir") as scandir:
+            events = self.scan(r"C:\Windows")
+
+        walk.assert_not_called()
+        stat.assert_not_called()
+        scandir.assert_not_called()
+        result = self.single_result(events)
+        self.assertEqual(result.status, "error")
+        self.assertIn("Ruta bloqueada", result.evidence)
+        self.assertIn("carpeta del sistema", result.evidence)
+        self.assertIn("Seleccione una carpeta de usuario", result.recommendation)
+        self.assertEqual([d for k, d in events if k == "file_finding"], [])
+
+    def test_folder_dialog_rejects_protected_selection(self):
+        original = self.app.selected_path
+        with patch.dict("Guardian.os.environ", self.PROTECTED_ENV, clear=False), \
+             patch("Guardian.filedialog.askdirectory", return_value=r"C:\Windows"), \
+             patch("Guardian.messagebox.showwarning") as warning:
+            self.app.elegir_carpeta()
+
+        self.assertEqual(self.app.selected_path, original)
+        warning.assert_called_once()
+        self.assertIn("C:\\Windows", warning.call_args.args[1])
+
+    def test_blocked_audit_clears_old_findings_and_restores_ui(self):
+        self.app.selected_path = r"C:\Windows"
+        self.app.check_results = [Guardian.CheckResult("Viejo", "finding")]
+        self.app.sensitive_files = ["viejo.txt"]
+        self.app._update_summary_counts()
+
+        def put(result):
+            def _put():
+                self.app.result_queue.put(("result", result))
+            return _put
+
+        with patch.dict("Guardian.os.environ", self.PROTECTED_ENV, clear=False), \
+             patch.object(self.app, "_check_firewall", new=put(Guardian.CheckResult("Firewall", "ok"))), \
+             patch.object(self.app, "_check_defender", new=put(Guardian.CheckResult("Defender", "ok"))), \
+             patch.object(self.app, "_check_rdp", new=put(Guardian.CheckResult("RDP", "ok"))), \
+             patch("Guardian.os.walk") as walk, \
+             patch("Guardian.os.stat") as stat, \
+             patch("Guardian.os.scandir") as scandir:
+            self.app.iniciar_auditoria()
+            self.wait_for_audit()
+
+        walk.assert_not_called()
+        stat.assert_not_called()
+        scandir.assert_not_called()
+        self.assertEqual(self.app.sensitive_files, [])
+        self.assertFalse(self.app.audit_in_progress)
+        self.assertEqual(str(self.app.btn_audit.cget("state")), "normal")
+        self.assertEqual(str(self.app.btn_new_audit.cget("state")), "normal")
+        file_results = [r for r in self.app.check_results if r.name == "Análisis de nombres de archivo"]
+        self.assertEqual(len(file_results), 1)
+        self.assertEqual(file_results[0].status, "error")
+        self.assertIn("Ruta bloqueada", file_results[0].evidence)
+
+
 class StateTests(GuardianGuiTestCase):
     def test_reset_audit_state_clears_all_audit_data(self):
         self.app.check_results = [
@@ -297,6 +399,12 @@ class StateTests(GuardianGuiTestCase):
         self.app.repair_actions_to_run = list(self.app.repair_actions)
         self.app.sensitive_files = ["viejo.txt"]
         self.app.audit_timestamp = "ayer"
+        self.app.pre_repair_results = [Guardian.CheckResult("Inicial", "finding")]
+        self.app.pre_repair_sensitive_files = ["inicial.txt"]
+        self.app.pre_repair_timestamp = "antes"
+        self.app.pre_repair_path = r"C:\Datos"
+        self.app.pre_repair_context_captured = True
+        self.app.post_repair_audit_attempted = True
         self.app._update_summary_counts()
         self.app.result_queue.put(("stale", None))
 
@@ -307,10 +415,62 @@ class StateTests(GuardianGuiTestCase):
         self.assertEqual(self.app.repair_actions_to_run, [])
         self.assertEqual(self.app.sensitive_files, [])
         self.assertEqual(self.app.audit_timestamp, "")
+        self.assertEqual(self.app.pre_repair_results, [])
+        self.assertEqual(self.app.pre_repair_sensitive_files, [])
+        self.assertEqual(self.app.pre_repair_timestamp, "")
+        self.assertEqual(self.app.pre_repair_path, "")
+        self.assertFalse(self.app.pre_repair_context_captured)
+        self.assertFalse(self.app.post_repair_audit_attempted)
         for key in ("ok", "finding", "unverifiable", "error"):
             self.assertEqual(str(self.app.summary_labels[key].cget("text")), "0")
         with self.assertRaises(queue.Empty):
             self.app.result_queue.get_nowait()
+
+    def test_capture_repair_context_is_an_independent_copy(self):
+        original = Guardian.CheckResult(
+            "Firewall", "finding", "estado inicial", "high", "revisar",
+            can_fix=True, fix_action="firewall_enable_all"
+        )
+        self.app.check_results = [original]
+        self.app.sensitive_files = ["inicial.txt"]
+        self.app.audit_timestamp = "inicial"
+        self.app.selected_path = r"C:\Datos"
+
+        self.app._capture_repair_context()
+        original.status = "ok"
+        original.evidence = "mutado después"
+
+        self.assertTrue(self.app.pre_repair_context_captured)
+        self.assertEqual(self.app.pre_repair_results[0].status, "finding")
+        self.assertEqual(self.app.pre_repair_results[0].evidence, "estado inicial")
+        self.assertEqual(self.app.pre_repair_sensitive_files, ["inicial.txt"])
+        self.assertEqual(self.app.pre_repair_timestamp, "inicial")
+        self.assertEqual(self.app.pre_repair_path, r"C:\Datos")
+
+    def test_preserved_reaudit_keeps_context_and_history(self):
+        self.app.check_results = [
+            Guardian.CheckResult(
+                "Firewall", "finding", "inicial", can_fix=True,
+                fix_action="firewall_enable_all"
+            )
+        ]
+        self.app.repair_actions = [Guardian.RepairAction("Acción", "d", "c")]
+        self.app._capture_repair_context()
+
+        self.app.nueva_auditoria(preserve_repair_context=True)
+
+        self.assertTrue(self.app.pre_repair_context_captured)
+        self.assertTrue(self.app.post_repair_audit_attempted)
+        self.assertEqual(len(self.app.pre_repair_results), 1)
+        self.assertEqual(len(self.app.repair_actions), 1)
+        self.assertEqual(self.app.check_results, [])
+        self.assertEqual(self.app.sensitive_files, [])
+
+        self.app.nueva_auditoria()
+        self.assertFalse(self.app.pre_repair_context_captured)
+        self.assertFalse(self.app.post_repair_audit_attempted)
+        self.assertEqual(self.app.pre_repair_results, [])
+        self.assertEqual(self.app.repair_actions, [])
 
     def test_two_consecutive_audits_do_not_inherit_state(self):
         first = [
@@ -339,6 +499,22 @@ class StateTests(GuardianGuiTestCase):
         for key in ("ok", "finding", "unverifiable", "error"):
             self.assertEqual(str(self.app.summary_labels[key].cget("text")), "1")
         self.assertEqual(str(self.app.btn_new_audit.cget("state")), "normal")
+
+    def test_defender_finding_does_not_disable_other_repairs(self):
+        defender = Guardian.CheckResult(
+            "Microsoft Defender", "finding", "Protección desactivada", "high",
+            Guardian.GuardianProMaster.DEFENDER_MANUAL_INTRO,
+            manual_guidance=Guardian.GuardianProMaster.DEFENDER_MANUAL_DETAILS
+        )
+        self.start_audit_with_results([defender])
+        self.assertEqual(str(self.app.btn_repair.cget("state")), "disabled")
+
+        firewall = Guardian.CheckResult(
+            "Firewall de Windows", "finding", can_fix=True,
+            fix_action="firewall_enable_all"
+        )
+        self.start_audit_with_results([defender, firewall])
+        self.assertEqual(str(self.app.btn_repair.cget("state")), "normal")
 
     def test_repair_dialog_preserves_previous_history(self):
         self.app.check_results = [
@@ -518,6 +694,36 @@ class RenderTests(GuardianGuiTestCase):
         self.assertTrue(tags["ok"])
         self.assertFalse(tags["finding"])
 
+    def test_defender_manual_guidance_is_visible_in_ui(self):
+        self.app._clear_results()
+        self.app._render_result(Guardian.CheckResult(
+            "Microsoft Defender", "finding",
+            "Protección en tiempo real: Deshabilitada", "high",
+            Guardian.GuardianProMaster.DEFENDER_MANUAL_INTRO,
+            manual_guidance=Guardian.GuardianProMaster.DEFENDER_MANUAL_DETAILS
+        ))
+        text = self.app.txt_results.get("1.0", "end")
+        for needle in (
+            "Requiere intervención manual",
+            "Seguridad de Windows",
+            "Administrar la configuración",
+            "Protección en tiempo real",
+            "Protección contra alteraciones",
+            "nueva auditoría",
+        ):
+            self.assertIn(needle, text)
+
+    def test_active_defender_ui_does_not_show_manual_guide(self):
+        self.app._clear_results()
+        self.app._render_result(Guardian.CheckResult(
+            "Microsoft Defender", "ok",
+            "Protección en tiempo real: Habilitada", "info",
+            "La protección en tiempo real está activa."
+        ))
+        text = self.app.txt_results.get("1.0", "end")
+        self.assertNotIn("Seguridad de Windows", text)
+        self.assertNotIn("intervención manual", text)
+
 
 class RepairRegressionTests(GuardianGuiTestCase):
     @staticmethod
@@ -542,6 +748,17 @@ class RepairRegressionTests(GuardianGuiTestCase):
             {"Name": "Private", "Enabled": private},
             {"Name": "Public", "Enabled": public},
         ])
+
+    @staticmethod
+    def defender_json(realtime=True, tamper=False, antivirus=True,
+                      mode="Normal", preference=False):
+        return json.dumps({
+            "RealTimeProtectionEnabled": realtime,
+            "IsTamperProtected": tamper,
+            "AntivirusEnabled": antivirus,
+            "AMRunningMode": mode,
+            "DisableRealtimeMonitoring": preference,
+        })
 
     def test_dispatch_uses_action_type_not_command_substring(self):
         action = Guardian.RepairAction(
@@ -600,21 +817,175 @@ class RepairRegressionTests(GuardianGuiTestCase):
         ])
         self.assertEqual(verification.status, "error")
 
-    def test_defender_requires_exact_true(self):
-        action = Guardian.RepairAction("Defender", "d", "c", action_type="defender_enable_rtp")
-        action.success = True
-        self.assertEqual(
-            self.verify_with(action, [("Get-MpComputerStatus", self.cp("True"))]).status,
-            "verified"
+    def test_defender_active_is_ok_without_manual_guidance(self):
+        status = json.loads(self.defender_json(realtime=True))
+        with patch.object(self.app, "_query_defender_status", return_value=status):
+            self.app._check_defender()
+        result = self.single_result(self.drain_queue())
+        self.assertEqual(result.status, "ok")
+        self.assertFalse(result.can_fix)
+        self.assertEqual(result.fix_action, "")
+        self.assertEqual(result.manual_guidance, "")
+        self.assertIn("Protección en tiempo real: Habilitada", result.evidence)
+        self.assertNotIn("Seguridad de Windows", result.recommendation)
+
+    def test_defender_disabled_is_finding_with_manual_guidance(self):
+        status = json.loads(self.defender_json(realtime=False, tamper=True))
+        with patch.object(self.app, "_query_defender_status", return_value=status):
+            self.app._check_defender()
+        result = self.single_result(self.drain_queue())
+
+        self.assertEqual(result.status, "finding")
+        self.assertFalse(result.can_fix)
+        self.assertEqual(result.fix_action, "")
+        self.assertIn("Deshabilitada", result.evidence)
+        self.assertIn("Tamper Protection: Activada", result.evidence)
+        self.assertIn("Requiere intervención manual", result.recommendation)
+        self.assertIn("Seguridad de Windows", result.recommendation)
+        self.assertNotIn("reparación automática", result.recommendation.lower())
+
+        for step in (
+            "1. Abre el menú Inicio.",
+            "2. Busca y abre 'Seguridad de Windows'",
+            "3. Entra en 'Protección antivirus y contra amenazas'",
+            "4. En 'Configuración de protección antivirus y contra amenazas'",
+            "5. Busca 'Protección en tiempo real'",
+            "6. Regresa a Guardian y ejecuta una nueva auditoría",
+        ):
+            self.assertIn(step, result.manual_guidance)
+        self.assertIn("Protección contra alteraciones", result.manual_guidance)
+        self.assertIn("directiva de administración", result.manual_guidance)
+        self.assertIn("No intentes eludir esas restricciones", result.manual_guidance)
+
+    def test_defender_query_error_is_not_confirmed_finding(self):
+        cases = (
+            (TimeoutExpired(cmd="powershell", timeout=15), "error"),
+            (RuntimeError("PowerShell no disponible"), "unverifiable"),
         )
+        for error, expected in cases:
+            with self.subTest(expected=expected):
+                with patch.object(self.app, "_query_defender_status", side_effect=error):
+                    self.app._check_defender()
+                result = self.single_result(self.drain_queue())
+                self.assertEqual(result.status, expected)
+                self.assertNotIn(result.status, ("ok", "finding"))
+                self.assertFalse(result.can_fix)
+
+    def test_defender_finding_does_not_create_repair_action(self):
+        self.app.check_results = [
+            Guardian.CheckResult(
+                "Microsoft Defender", "finding", "Protección desactivada", "high",
+                Guardian.GuardianProMaster.DEFENDER_MANUAL_INTRO,
+                manual_guidance=Guardian.GuardianProMaster.DEFENDER_MANUAL_DETAILS
+            )
+        ]
+        self.assertEqual(self.app._build_repair_actions(), [])
+
+        # Tampoco debe revivir la acción antigua si un resultado legado la conserva.
+        self.app.check_results = [
+            Guardian.CheckResult(
+                "Microsoft Defender", "finding", can_fix=True,
+                fix_action="defender_enable_rtp"
+            )
+        ]
+        self.assertEqual(self.app._build_repair_actions(), [])
+
+    def test_repair_selection_cannot_execute_defender_change(self):
+        self.app.check_results = [
+            Guardian.CheckResult(
+                "Microsoft Defender", "finding", "Protección desactivada", "high",
+                Guardian.GuardianProMaster.DEFENDER_MANUAL_INTRO,
+                manual_guidance=Guardian.GuardianProMaster.DEFENDER_MANUAL_DETAILS
+            ),
+            Guardian.CheckResult(
+                "Firewall de Windows", "finding", can_fix=True,
+                fix_action="firewall_enable_all"
+            ),
+            Guardian.CheckResult(
+                "Escritorio Remoto (RDP)", "finding", can_fix=True,
+                fix_action="rdp_disable"
+            ),
+        ]
+        actions = self.app._build_repair_actions()
         self.assertEqual(
-            self.verify_with(action, [("Get-MpComputerStatus", self.cp("False"))]).status,
-            "unverified"
+            [action.action_type for action in actions],
+            ["firewall_enable_all", "rdp_disable"]
         )
+        for action in actions:
+            self.assertNotIn("Set-MpPreference", action.command)
+            self.assertNotIn("DisableRealtimeMonitoring", action.command)
+            self.assertNotIn("RealTimeProtection", action.command)
+
+        with patch("Guardian.messagebox.askyesno", return_value=True):
+            selected = self.app._seleccionar_acciones(actions, is_admin=True)
+        self.assertEqual(selected, actions)
+        self.assertTrue(all(a.action_type != "defender_enable_rtp" for a in selected))
+
+    def test_firewall_repair_does_not_mark_defender_fixed(self):
+        defender = Guardian.CheckResult(
+            "Microsoft Defender", "finding", "Protección desactivada", "high",
+            Guardian.GuardianProMaster.DEFENDER_MANUAL_INTRO,
+            manual_guidance=Guardian.GuardianProMaster.DEFENDER_MANUAL_DETAILS
+        )
+        firewall = Guardian.CheckResult(
+            "Firewall de Windows", "finding", can_fix=True,
+            fix_action="firewall_enable_all"
+        )
+        self.app.check_results = [defender, firewall]
+        actions = self.app._build_repair_actions()
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].action_type, "firewall_enable_all")
+        self.app.repair_actions = list(actions)
+        self.app.repair_actions_to_run = list(actions)
+
+        with patch.object(self.app, "_is_admin", return_value=True), \
+             patch("Guardian.subprocess.run", return_value=self.cp()), \
+             patch.object(self.app, "_verify_repair",
+                          return_value=Guardian.RepairVerification("verified", "ok")):
+            self.app._worker_reparar()
+
+        self.assertTrue(actions[0].attempted)
+        self.assertTrue(actions[0].verified)
+        self.assertEqual(defender.status, "finding")
+        self.assertFalse(defender.can_fix)
+        self.assertEqual(self.app.repair_actions, actions)
+        self.assertFalse(any(a.name == "Microsoft Defender" for a in self.app.repair_actions))
+
+        # La misma separación se aplica a RDP: solo se construye su acción.
+        self.app.check_results = [
+            defender,
+            Guardian.CheckResult(
+                "Escritorio Remoto (RDP)", "finding", can_fix=True,
+                fix_action="rdp_disable"
+            ),
+        ]
+        rdp_actions = self.app._build_repair_actions()
+        self.assertEqual([a.action_type for a in rdp_actions], ["rdp_disable"])
+        self.assertFalse(any(a.name == "Microsoft Defender" for a in rdp_actions))
+
+    def test_source_has_no_automatic_defender_repair_command(self):
+        with open(Guardian.__file__, encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertNotIn("Set-MpPreference", source)
+        self.assertNotIn("defender_enable_rtp", source)
+
+    def test_firewall_and_rdp_actions_remain_available(self):
+        self.app.check_results = [
+            Guardian.CheckResult(
+                "Firewall de Windows", "finding", can_fix=True,
+                fix_action="firewall_enable_all"
+            ),
+            Guardian.CheckResult(
+                "Escritorio Remoto (RDP)", "finding", can_fix=True,
+                fix_action="rdp_disable"
+            ),
+        ]
+        actions = self.app._build_repair_actions()
         self.assertEqual(
-            self.verify_with(action, [("Get-MpComputerStatus", self.cp(""))]).status,
-            "error"
+            [action.action_type for action in actions],
+            ["firewall_enable_all", "rdp_disable"]
         )
+        self.assertTrue(all(action.requires_admin for action in actions))
 
     def test_rdp_requires_registry_and_firewall_rules(self):
         action = Guardian.RepairAction("RDP", "d", "c", action_type="rdp_disable")
@@ -770,6 +1141,14 @@ class RepairRegressionTests(GuardianGuiTestCase):
 
 
 class PdfTests(GuardianGuiTestCase):
+    @staticmethod
+    def defender_finding(evidence="Protección en tiempo real: Deshabilitada"):
+        return Guardian.CheckResult(
+            "Microsoft Defender", "finding", evidence, "high",
+            Guardian.GuardianProMaster.DEFENDER_MANUAL_INTRO,
+            manual_guidance=Guardian.GuardianProMaster.DEFENDER_MANUAL_DETAILS
+        )
+
     def test_pdf_contains_scope_statuses_history_and_privacy_note(self):
         self.app.selected_path = r"C:\Datos\GuardianPrueba"
         self.app.audit_timestamp = "24/10/2026 12:00:00"
@@ -861,6 +1240,306 @@ class PdfTests(GuardianGuiTestCase):
             b"solo nombres, no contenido",
         ):
             self.assertIn(needle, data, f"Falta en el PDF: {needle!r}")
+
+    def _render_current_pdf(self):
+        with tempfile.TemporaryDirectory() as td:
+            output = os.path.join(td, "informe.pdf")
+            real_fpdf = Guardian.FPDF
+
+            def factory(*args, **kwargs):
+                pdf = real_fpdf(*args, **kwargs)
+                pdf.set_compression(False)
+                return pdf
+
+            with patch("Guardian.FPDF", side_effect=factory), \
+                 patch("Guardian.filedialog.asksaveasfilename", return_value=output), \
+                 patch("Guardian.messagebox.showinfo") as info, \
+                 patch("Guardian.messagebox.showerror") as error:
+                self.app.crear_pdf()
+
+            info.assert_called_once()
+            error.assert_not_called()
+            with open(output, "rb") as handle:
+                return handle.read()
+
+    def test_pdf_defender_finding_includes_manual_activation_section(self):
+        self.app.selected_path = r"C:\Datos\Prueba"
+        self.app.audit_timestamp = "25/10/2026 10:00:00"
+        self.app.check_results = [self.defender_finding()]
+
+        data = self._render_current_pdf()
+
+        for needle in (
+            b"ACTIVACI",
+            b"MANUAL DE MICROSOFT DEFENDER",
+            b"Seguridad de Windows",
+            b"Administrar la configuraci",
+            b"Protecci",
+            b"tiempo real",
+            b"nueva auditor",
+            b"Protecci",
+            b"alteraciones",
+            b"directiva de administraci",
+            b"no modifica autom",
+        ):
+            self.assertIn(needle, data, f"Falta en la guía manual del PDF: {needle!r}")
+        self.assertNotIn(b"Set-MpPreference", data)
+
+    def test_pdf_active_defender_has_no_manual_activation_section(self):
+        self.app.selected_path = r"C:\Datos\Prueba"
+        self.app.audit_timestamp = "25/10/2026 10:00:00"
+        self.app.check_results = [
+            Guardian.CheckResult(
+                "Microsoft Defender", "ok",
+                "Protección en tiempo real: Habilitada", "info",
+                "La protección en tiempo real está activa."
+            )
+        ]
+
+        data = self._render_current_pdf()
+
+        self.assertNotIn(b"ACTIVACI", data)
+        self.assertNotIn(b"Seguridad de Windows", data)
+
+    def test_pdf_manual_activation_is_not_attributed_to_guardian(self):
+        self.app.selected_path = r"C:\Datos\Prueba"
+        self.app.audit_timestamp = "25/10/2026 10:05:00"
+        self.app.pre_repair_context_captured = True
+        self.app.pre_repair_path = r"C:\Datos\Prueba"
+        self.app.pre_repair_timestamp = "25/10/2026 10:00:00"
+        self.app.pre_repair_results = [self.defender_finding()]
+        self.app.pre_repair_sensitive_files = []
+        self.app.repair_actions = []
+        self.app.post_repair_audit_attempted = True
+        self.app.check_results = [
+            Guardian.CheckResult(
+                "Microsoft Defender", "ok",
+                "Protección en tiempo real: Habilitada", "info",
+                "La protección en tiempo real está activa."
+            )
+        ]
+
+        data = self._render_current_pdf()
+
+        self.assertIn(b"ACTIVACI", data)
+        self.assertIn(b"Estado posterior", data)
+        self.assertIn(b"Habilitada", data)
+        self.assertNotIn(b"Guardian activ", data)
+        self.assertNotIn(b"Set-MpPreference", data)
+        self.assertNotIn(b"defender_enable_rtp", data)
+
+    def test_pdf_firewall_repair_keeps_defender_manual_guidance(self):
+        self.app.selected_path = r"C:\Datos\Prueba"
+        self.app.audit_timestamp = "25/10/2026 10:05:00"
+        self.app.pre_repair_context_captured = True
+        self.app.pre_repair_path = r"C:\Datos\Prueba"
+        self.app.pre_repair_timestamp = "25/10/2026 10:00:00"
+        self.app.pre_repair_results = [
+            self.defender_finding(),
+            Guardian.CheckResult(
+                "Firewall de Windows", "finding", "Firewall desactivado", "high",
+                "Activar firewall", can_fix=True, fix_action="firewall_enable_all"
+            ),
+        ]
+        self.app.pre_repair_sensitive_files = []
+        firewall = Guardian.RepairAction(
+            "Habilitar firewall", "d", "Set-NetFirewallProfile -All -Enabled True",
+            action_type="firewall_enable_all"
+        )
+        firewall.attempted = True
+        firewall.success = True
+        firewall.verified = True
+        firewall.verification_status = "verified"
+        firewall.verification_evidence = "Tres perfiles habilitados"
+        self.app.repair_actions = [firewall]
+        self.app.post_repair_audit_attempted = True
+        self.app.check_results = [
+            self.defender_finding("Protección en tiempo real: Deshabilitada"),
+            Guardian.CheckResult(
+                "Firewall de Windows", "ok", "Tres perfiles habilitados", "info", "Nada"
+            ),
+        ]
+
+        data = self._render_current_pdf()
+
+        for needle in (
+            b"ACTIVACI",
+            b"MANUAL DE MICROSOFT DEFENDER",
+            b"Seguridad de Windows",
+            b"Habilitar firewall",
+            b"EJECUTADA Y VERIFICADA",
+            b"Estado posterior",
+            b"Deshabilitada",
+        ):
+            self.assertIn(needle, data, f"Falta en el PDF tras reparar firewall: {needle!r}")
+        self.assertNotIn(b"Set-MpPreference", data)
+
+    def test_pdf_repair_cycle_contains_initial_actions_and_post_state(self):
+        self.app.selected_path = r"C:\Datos\Prueba"
+        self.app.audit_timestamp = "25/10/2026 10:05:00"
+        self.app.pre_repair_context_captured = True
+        self.app.pre_repair_path = r"C:\Datos\Prueba"
+        self.app.pre_repair_timestamp = "25/10/2026 10:00:00"
+        self.app.pre_repair_results = [
+            Guardian.CheckResult(
+                "Firewall", "finding", "Firewall desactivado", "high", "Activar firewall"
+            )
+        ]
+        self.app.pre_repair_sensitive_files = []
+        action = Guardian.RepairAction(
+            "Habilitar firewall", "d", "Set-NetFirewallProfile -All -Enabled True",
+            action_type="firewall_enable_all"
+        )
+        action.attempted = True
+        action.success = True
+        action.verified = True
+        action.verification_status = "verified"
+        action.verification_evidence = "Tres perfiles habilitados"
+        self.app.repair_actions = [action]
+        self.app.post_repair_audit_attempted = True
+        self.app.check_results = [
+            Guardian.CheckResult("Firewall", "ok", "Tres perfiles habilitados", "info", "Nada")
+        ]
+
+        data = self._render_current_pdf()
+
+        for needle in (
+            b"Estado inicial",
+            b"Firewall desactivado",
+            b"HALLAZGO",
+            b"Acciones de correcci",
+            b"EJECUTADA Y VERIFICADA",
+            b"Estado posterior",
+            b"OK",
+            b"Auditor",
+            b"Reauditor",
+        ):
+            self.assertIn(needle, data, f"Falta en el PDF del ciclo: {needle!r}")
+
+    def test_pdf_failed_repair_without_reaudit_does_not_claim_resolution(self):
+        self.app.selected_path = r"C:\Datos\Prueba"
+        self.app.pre_repair_context_captured = True
+        self.app.pre_repair_path = r"C:\Datos\Prueba"
+        self.app.pre_repair_timestamp = "25/10/2026 10:00:00"
+        self.app.pre_repair_results = [
+            self.defender_finding(),
+            Guardian.CheckResult(
+                "Firewall de Windows", "finding", "Firewall desactivado", "high",
+                "Activar firewall", can_fix=True, fix_action="firewall_enable_all"
+            ),
+        ]
+        self.app.pre_repair_sensitive_files = []
+        failed = Guardian.RepairAction(
+            "Habilitar firewall", "d", "Set-NetFirewallProfile -All -Enabled True",
+            action_type="firewall_enable_all"
+        )
+        failed.attempted = True
+        failed.success = False
+        failed.error = "Comando bloqueado"
+        failed.verification_status = "not_checked"
+        self.app.repair_actions = [failed]
+        self.app.post_repair_audit_attempted = False
+        self.app.check_results = []
+
+        data = self._render_current_pdf()
+
+        self.assertIn(b"Estado inicial", data)
+        self.assertIn(b"Firewall desactivado", data)
+        self.assertIn(b"HALLAZGO", data)
+        self.assertIn(b"FALLIDA", data)
+        self.assertIn(b"ACTIVACI", data)
+        self.assertIn(b"MANUAL DE MICROSOFT DEFENDER", data)
+        self.assertIn(b"No se realiz", data)
+        self.assertIn(b"no est", data)
+        self.assertNotIn(b"EJECUTADA Y VERIFICADA", data)
+        self.assertNotIn(b"Set-MpPreference", data)
+
+    def test_pdf_failed_repair_with_reaudit_keeps_finding(self):
+        self.app.selected_path = r"C:\Datos\Prueba"
+        self.app.audit_timestamp = "25/10/2026 10:05:00"
+        self.app.pre_repair_context_captured = True
+        self.app.pre_repair_path = r"C:\Datos\Prueba"
+        self.app.pre_repair_timestamp = "25/10/2026 10:00:00"
+        self.app.pre_repair_results = [
+            self.defender_finding(),
+            Guardian.CheckResult(
+                "Firewall de Windows", "finding", "Firewall desactivado", "high",
+                "Activar firewall", can_fix=True, fix_action="firewall_enable_all"
+            ),
+        ]
+        self.app.pre_repair_sensitive_files = []
+        failed = Guardian.RepairAction(
+            "Habilitar firewall", "d", "Set-NetFirewallProfile -All -Enabled True",
+            action_type="firewall_enable_all"
+        )
+        failed.attempted = True
+        failed.success = False
+        failed.error = "Comando bloqueado"
+        failed.verification_status = "not_checked"
+        self.app.repair_actions = [failed]
+        self.app.post_repair_audit_attempted = True
+        self.app.check_results = [
+            self.defender_finding("Protección en tiempo real: Deshabilitada"),
+            Guardian.CheckResult(
+                "Firewall de Windows", "finding", "Firewall sigue desactivado", "high",
+                "Revisar manualmente"
+            ),
+        ]
+
+        data = self._render_current_pdf()
+
+        self.assertIn(b"Estado inicial", data)
+        self.assertIn(b"Firewall desactivado", data)
+        self.assertIn(b"FALLIDA", data)
+        self.assertIn(b"Estado posterior", data)
+        self.assertIn(b"Firewall sigue desactivado", data)
+        self.assertIn(b"ACTIVACI", data)
+        self.assertIn(b"MANUAL DE MICROSOFT DEFENDER", data)
+        self.assertNotIn(b"EJECUTADA Y VERIFICADA", data)
+        self.assertNotIn(b"Set-MpPreference", data)
+
+    def test_new_audit_pdf_does_not_include_previous_repair_cycle(self):
+        self.app.pre_repair_context_captured = True
+        self.app.pre_repair_results = [
+            Guardian.CheckResult("Viejo", "finding", "evidencia_inicial_unica")
+        ]
+        self.app.pre_repair_timestamp = "antes"
+        self.app.pre_repair_path = r"C:\Viejo"
+        self.app.repair_actions = [
+            Guardian.RepairAction("Accion vieja", "d", "cmd")
+        ]
+        self.app.post_repair_audit_attempted = True
+        self.app.audit_timestamp = "nueva"
+        self.app.selected_path = r"C:\Nueva"
+        self.app.check_results = [
+            Guardian.CheckResult("Nuevo", "ok", "evidencia_nueva_unica")
+        ]
+        self.app._reset_audit_state()
+        self.app.audit_timestamp = "nueva"
+        self.app.selected_path = r"C:\Nueva"
+        self.app.check_results = [
+            Guardian.CheckResult("Nuevo", "ok", "evidencia_nueva_unica")
+        ]
+
+        data = self._render_current_pdf()
+
+        self.assertIn(b"evidencia_nueva_unica", data)
+        self.assertNotIn(b"evidencia_inicial_unica", data)
+        self.assertNotIn(b"Accion vieja", data)
+        self.assertFalse(self.app.pre_repair_context_captured)
+
+    def test_finish_repairs_requests_preserving_reaudit(self):
+        action = Guardian.RepairAction("Accion", "d", "cmd")
+        action.attempted = True
+        self.app.repair_actions_to_run = [action]
+        self.app.repair_in_progress = True
+        self.app.check_results = [Guardian.CheckResult("Firewall", "finding")]
+
+        with patch("Guardian.messagebox.askyesno", return_value=True), \
+             patch.object(self.app, "nueva_auditoria") as new_audit:
+            self.app._finish_repairs()
+
+        new_audit.assert_called_once_with(auto_start=True, preserve_repair_context=True)
 
 
 if __name__ == "__main__":
