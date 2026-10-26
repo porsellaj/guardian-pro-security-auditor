@@ -15,17 +15,28 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from subprocess import CompletedProcess, TimeoutExpired
 from unittest.mock import patch
 
 import Guardian
+import guardian_workspace as workspace
 
 
 class GuardianGuiTestCase(unittest.TestCase):
     """Base con una instancia real de la interfaz, sin mainloop."""
 
     def setUp(self):
-        self.app = Guardian.GuardianProMaster()
+        self.workspace_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.workspace_temp.cleanup)
+        self.app = Guardian.GuardianProMaster(
+            workspace_dir=self.workspace_temp.name,
+            device_identity={
+                "id": "dev_test_suite",
+                "name": "TEST-PC",
+                "os": "Windows 11 Pro",
+            },
+        )
         self.app.withdraw()
         self.app.update_idletasks()
         self.addCleanup(self._destroy_app)
@@ -1873,6 +1884,266 @@ class PdfTests(GuardianGuiTestCase):
             self.app._finish_repairs()
 
         new_audit.assert_called_once_with(auto_start=True, preserve_repair_context=True)
+
+
+class OperationsCenterTests(GuardianGuiTestCase):
+    """Integración de las vistas nuevas con el ciclo de auditoría existente."""
+
+    def wait_for_import(self, timeout=6):
+        deadline = time.time() + timeout
+        while self.app.import_in_progress and time.time() < deadline:
+            self.app.update()
+            time.sleep(0.01)
+        self.app.update()
+        self.assertFalse(self.app.import_in_progress, "La importación no terminó a tiempo")
+
+    @staticmethod
+    def make_report(device_id, name, status, when, audit_id):
+        record = workspace.build_audit_record(
+            [{
+                "name": "Firewall de Windows",
+                "status": status,
+                "severity": "high" if status == "finding" else "info",
+                "recommendation": "Habilite el firewall y vuelva a auditar.",
+            }],
+            {"id": device_id, "name": name, "os": "Windows 11 Pro"},
+            collected_at=when,
+            audit_id=audit_id,
+        )
+        return workspace.report_from_audit(record)
+
+    @staticmethod
+    def write_report(path, report):
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, ensure_ascii=False)
+
+    def render_pdf(self):
+        with tempfile.TemporaryDirectory() as td:
+            output = os.path.join(td, "informe.pdf")
+            real_fpdf = Guardian.FPDF
+
+            def factory(*args, **kwargs):
+                pdf = real_fpdf(*args, **kwargs)
+                pdf.set_compression(False)
+                return pdf
+
+            with patch("Guardian.FPDF", side_effect=factory), \
+                 patch("Guardian.filedialog.asksaveasfilename", return_value=output), \
+                 patch("Guardian.messagebox.showinfo") as info, \
+                 patch("Guardian.messagebox.showerror") as error:
+                self.app.crear_pdf()
+            self.assertFalse(error.called, error.call_args)
+            with open(output, "rb") as handle:
+                return handle.read()
+
+    def test_operations_center_views_and_legacy_controls_exist(self):
+        self.assertIn("overview", self.app.views)
+        self.assertIn("action", self.app.views)
+        self.assertIn("history", self.app.views)
+        self.assertIn("fleet", self.app.views)
+        self.assertIn("audit", self.app.views)
+        for key in ("ok", "finding", "unverifiable", "error"):
+            self.assertIn(key, self.app.summary_labels)
+        for name in (
+            "btn_audit", "btn_repair", "btn_report", "btn_new_audit",
+            "btn_select_folder", "btn_export_json", "btn_import_json",
+            "btn_demo_toggle", "txt_results", "lbl_progress", "progress_bar",
+        ):
+            self.assertTrue(hasattr(self.app, name), name)
+        self.app.show_view("fleet")
+        self.assertEqual(self.app.current_view, "fleet")
+        self.assertEqual(str(self.app.header_title.cget("text")), "Vista de equipos")
+        self.app.show_view("overview")
+
+    def test_finished_audits_are_saved_and_compared(self):
+        first = Guardian.CheckResult(
+            "Firewall de Windows", "finding", "perfil público desactivado", "high",
+            "Habilite el firewall.", can_fix=True, fix_action="firewall_enable_all",
+        )
+        second = Guardian.CheckResult(
+            "Firewall de Windows", "ok", "todos los perfiles activos", "info",
+            "Mantener la configuración.",
+        )
+        self.start_audit_with_results([first])
+        self.assertEqual(len(self.app.history), 1)
+        self.assertIsNotNone(self.app.current_audit_record)
+        self.assertEqual(
+            self.app.current_audit_record["checks"][0]["check_id"], "firewall"
+        )
+
+        self.start_audit_with_results([second])
+        self.assertEqual(len(self.app.history), 2)
+        comparison = self.app.current_audit_record.get("comparison")
+        self.assertIsNotNone(comparison)
+        self.assertEqual(comparison["summary"]["resolved"], 1)
+        self.app.show_view("history")
+        self.app.update_idletasks()
+
+    def test_demo_is_in_memory_and_disables_real_actions(self):
+        history_before = len(self.app.history)
+        self.app._toggle_demo()
+        self.assertTrue(self.app.demo_mode)
+        self.assertEqual(len(self.app.demo_audits), 4)
+        self.assertEqual(
+            len({record["device"]["id"] for record in self.app.demo_audits}), 3
+        )
+        self.assertTrue(self.app.demo_banner.grid_info())
+        self.assertEqual(str(self.app.btn_audit.cget("state")), "disabled")
+        self.assertEqual(str(self.app.btn_repair.cget("state")), "disabled")
+        self.assertEqual(str(self.app.btn_report.cget("state")), "disabled")
+        self.assertEqual(str(self.app.btn_export_json.cget("state")), "disabled")
+        self.assertEqual(str(self.app.btn_import_json.cget("state")), "disabled")
+        self.assertFalse(self.app._current_action_context()[2])
+        self.app._focus_on_record(self.app.demo_audits[-1], "demo")
+        self.assertEqual(self.app.current_view, "action")
+        self.assertEqual(str(self.app.btn_repair.cget("state")), "disabled")
+
+        self.app._toggle_demo()
+        self.assertFalse(self.app.demo_mode)
+        self.assertEqual(self.app.demo_audits, [])
+        self.assertEqual(len(self.app.history), history_before)
+        self.assertFalse(self.app.demo_banner.grid_info())
+        self.assertEqual(str(self.app.btn_audit.cget("state")), "normal")
+
+    def test_import_async_adds_reports_and_detects_duplicates(self):
+        with tempfile.TemporaryDirectory() as td:
+            first = self.make_report(
+                "dev_import_a", "IMPORT-A", "finding",
+                (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(timespec="seconds"),
+                "audit_import_a",
+            )
+            second = self.make_report(
+                "dev_import_b", "IMPORT-B", "ok",
+                (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(timespec="seconds"),
+                "audit_import_b",
+            )
+            path_a = os.path.join(td, "a.json")
+            path_b = os.path.join(td, "b.json")
+            self.write_report(path_a, first)
+            self.write_report(path_b, second)
+
+            with patch("Guardian.filedialog.askopenfilenames", return_value=(path_a, path_b)), \
+                 patch("Guardian.messagebox.showinfo"):
+                self.app._start_import()
+                self.wait_for_import()
+            self.assertEqual(len(self.app.fleet_reports), 2)
+            self.assertTrue(any("nuevo" in message for message in self.app.import_messages))
+            self.assertEqual(self.app.current_view, "fleet")
+
+            with patch("Guardian.filedialog.askopenfilenames", return_value=(path_a,)), \
+                 patch("Guardian.messagebox.showinfo"):
+                self.app._start_import()
+                self.wait_for_import()
+            self.assertEqual(len(self.app.fleet_reports), 2)
+            self.assertTrue(any("duplicado" in message for message in self.app.import_messages))
+
+    def test_imported_report_plan_is_read_only(self):
+        report = self.make_report(
+            "dev_readonly", "READONLY", "finding",
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "audit_readonly",
+        )
+        self.app.focus_record = report
+        self.app.focus_source = "imported"
+        self.app._refresh_action_view()
+        self.app._refresh_sidebar_state()
+        self.assertFalse(self.app._current_action_context()[2])
+        self.assertEqual(str(self.app.btn_repair.cget("state")), "disabled")
+        plan = workspace.build_action_plan(report["checks"], allow_repair=False)
+        self.assertTrue(plan)
+        self.assertFalse(any(item["can_repair"] for item in plan))
+
+    def test_export_requires_confirmation_and_excludes_paths(self):
+        record = workspace.build_audit_record(
+            [{
+                "name": "Análisis de nombres de archivo",
+                "status": "finding",
+                "severity": "low",
+                "recommendation": r"Revise C:\Users\Ana\passwords.txt",
+            }],
+            {"id": "dev_export", "name": "EXPORT-PC", "os": "Windows 11 Pro"},
+            collected_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            audit_id="audit_export_ui",
+        )
+        self.app.current_audit_record = record
+        with patch("Guardian.messagebox.askokcancel", return_value=False) as confirm, \
+             patch("Guardian.filedialog.asksaveasfilename") as save:
+            self.app._export_current_report()
+        confirm.assert_called_once()
+        save.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as td:
+            target = os.path.join(td, "export.json")
+            with patch("Guardian.messagebox.askokcancel", return_value=True), \
+                 patch("Guardian.filedialog.asksaveasfilename", return_value=target), \
+                 patch("Guardian.messagebox.showinfo"):
+                self.app._export_current_report()
+            with open(target, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            workspace.validate_report(payload)
+            text = json.dumps(payload)
+            self.assertNotIn("passwords.txt", text)
+            self.assertNotIn(r"C:\Users", text)
+
+    def test_storage_failure_does_not_break_audit_or_pdf(self):
+        result = Guardian.CheckResult(
+            "Firewall de Windows", "finding", "evidencia", "high",
+            "Habilite el firewall.", can_fix=True, fix_action="firewall_enable_all",
+        )
+        with patch.object(
+            self.app.workspace, "save_audit",
+            side_effect=workspace.WorkspaceError("fallo simulado"),
+        ):
+            self.start_audit_with_results([result])
+        self.assertEqual(self.app.history, [])
+        self.assertIsNotNone(self.app.current_audit_record)
+        self.assertIn("fallo simulado", self.app.storage_warning)
+        self.assertFalse(self.app.audit_in_progress)
+
+    def test_pdf_executive_summary_is_first_and_honest_without_history(self):
+        self.app.audit_timestamp = "24/10/2026 12:00:00"
+        self.app.current_audit_record = None
+        self.app.check_results = [
+            Guardian.CheckResult(
+                "Firewall de Windows", "finding", "perfil desactivado", "high",
+                "Habilite el firewall.",
+            ),
+            Guardian.CheckResult(
+                "Microsoft Defender", "ok", "protección activa", "info",
+                "Mantener.",
+            ),
+        ]
+        data = self.render_pdf()
+        self.assertIn(b"Resumen ejecutivo", data)
+        self.assertIn(b"Dispositivo evaluado", data)
+        self.assertIn(b"No hay una auditor", data)
+        self.assertLess(data.find(b"Resumen ejecutivo"), data.find(b"Hallazgos"))
+
+    def test_pdf_executive_summary_uses_saved_comparison(self):
+        self.app.workspace.save_audit(
+            [{
+                "name": "Firewall de Windows", "status": "finding",
+                "severity": "high", "recommendation": "Habilite el firewall.",
+            }],
+            self.app.device_identity,
+            collected_at=(datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(timespec="seconds"),
+        )
+        current = self.app.workspace.save_audit(
+            [{
+                "name": "Firewall de Windows", "status": "ok",
+                "severity": "info", "recommendation": "Mantener.",
+            }],
+            self.app.device_identity,
+            collected_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        )
+        self.app.current_audit_record = current
+        self.app.audit_timestamp = "24/10/2026 12:00:00"
+        self.app.check_results = [
+            Guardian.CheckResult("Firewall de Windows", "ok", "activo", "info", "Mantener.")
+        ]
+        data = self.render_pdf()
+        self.assertIn(b"Resumen ejecutivo", data)
+        self.assertIn(b"Resueltos confirmados", data)
 
 
 if __name__ == "__main__":
