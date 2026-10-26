@@ -10,6 +10,7 @@ registro. Las funciones que dependen de PowerShell se sustituyen por mocks.
 import json
 import os
 import queue
+import subprocess
 import tempfile
 import threading
 import time
@@ -99,6 +100,33 @@ class GuardianGuiTestCase(unittest.TestCase):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(content)
+
+    @staticmethod
+    def create_directory_link(link, target):
+        """Crea un enlace de directorio y devuelve el tipo creado.
+
+        Intenta primero un enlace simbólico. En Windows, si el entorno no
+        concede ese privilegio, usa una junction mediante `mklink /J`.
+        Devuelve "" si el entorno no permite crear ninguno de los dos.
+        """
+        try:
+            os.symlink(target, link, target_is_directory=True)
+            return "symlink"
+        except (OSError, NotImplementedError):
+            pass
+
+        if os.name == "nt":
+            try:
+                result = subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", link, target],
+                    capture_output=True,
+                    text=True,
+                )
+            except OSError:
+                return ""
+            if result.returncode == 0 and os.path.exists(link):
+                return "junction"
+        return ""
 
 
 class FileScanTests(GuardianGuiTestCase):
@@ -259,6 +287,78 @@ class FileScanTests(GuardianGuiTestCase):
             self.assertFalse(kwargs["followlinks"])
             self.assertEqual(self.single_result(events).status, "ok")
 
+    def test_descendant_link_to_outside_is_excluded_and_reported(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
+            self.touch(os.path.join(root, "notas.txt"))
+            self.touch(os.path.join(outside, "password.txt"))
+            link = os.path.join(root, "enlace_externo")
+            if not self.create_directory_link(link, outside):
+                self.skipTest("El entorno no permite crear enlaces simbólicos ni junctions")
+
+            events = self.scan(root)
+            result = self.single_result(events)
+            findings = [data for kind, data in events if kind == "file_finding"]
+
+            self.assertEqual(findings, [])
+            self.assertEqual(result.status, "unverifiable")
+            self.assertIn("enlace(s)/punto(s) de reanálisis excluido(s)", result.evidence)
+            self.assertIn("no se puede confirmar", result.recommendation.lower())
+            self.assertIn("ámbito autorizado", result.recommendation)
+
+    def test_descendant_link_to_protected_root_is_excluded(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as protected:
+            self.touch(os.path.join(root, "notas.txt"))
+            self.touch(os.path.join(protected, "password.txt"))
+            link = os.path.join(root, "enlace_protegido")
+            if not self.create_directory_link(link, protected):
+                self.skipTest("El entorno no permite crear enlaces simbólicos ni junctions")
+
+            with patch.dict("Guardian.os.environ", {"ProgramData": protected}, clear=False):
+                events = self.scan(root)
+
+            result = self.single_result(events)
+            findings = [data for kind, data in events if kind == "file_finding"]
+
+            self.assertEqual(findings, [])
+            self.assertEqual(result.status, "unverifiable")
+            self.assertIn("enlace(s)/punto(s) de reanálisis excluido(s)", result.evidence)
+
+    def test_walk_outside_authorized_scope_is_not_scanned(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
+            self.touch(os.path.join(root, "notas.txt"))
+            self.touch(os.path.join(outside, "password.txt"))
+
+            def fake_walk(path, topdown=True, onerror=None, followlinks=False):
+                yield path, [], ["notas.txt"]
+                yield outside, [], ["password.txt"]
+
+            with patch("Guardian.os.walk", side_effect=fake_walk):
+                events = self.scan(root)
+
+            result = self.single_result(events)
+            findings = [data for kind, data in events if kind == "file_finding"]
+
+            self.assertEqual(findings, [])
+            self.assertEqual(result.status, "unverifiable")
+            self.assertIn("fuera del ámbito autorizado", result.evidence)
+
+    def test_selected_link_to_valid_user_folder_is_scanned_by_real_path(self):
+        with tempfile.TemporaryDirectory() as parent:
+            target = os.path.join(parent, "destino")
+            os.mkdir(target)
+            self.touch(os.path.join(target, "password.txt"))
+            link = os.path.join(parent, "acceso_valido")
+            if not self.create_directory_link(link, target):
+                self.skipTest("El entorno no permite crear enlaces simbólicos ni junctions")
+
+            events = self.scan(link)
+            result = self.single_result(events)
+            findings = [data for kind, data in events if kind == "file_finding"]
+
+            self.assertEqual(result.status, "finding")
+            self.assertEqual(len(findings), 1)
+            self.assertTrue(findings[0].lower().startswith(os.path.realpath(target).lower()))
+
     def test_audit_final_state_with_real_file_scan(self):
         with tempfile.TemporaryDirectory() as td:
             self.touch(os.path.join(td, "password.txt"))
@@ -326,6 +426,166 @@ class ProtectedPathTests(GuardianGuiTestCase):
         with patch.dict("Guardian.os.environ", self.PROTECTED_ENV, clear=False):
             self.assertTrue(self.app._protected_scan_reason(r"c:\windows\system32"))
             self.assertTrue(self.app._protected_scan_reason(r"C:/PROGRAM FILES/App"))
+
+    def test_dot_segments_and_mixed_separators_resolve_to_protected(self):
+        with patch.dict("Guardian.os.environ", self.PROTECTED_ENV, clear=False):
+            for path in (
+                r"C:\Windows\System32\..",
+                r"C:/Windows/./System32/../",
+                r"C:\WINDOWS\System32\Temp\..",
+            ):
+                with self.subTest(path=path):
+                    self.assertTrue(self.app._protected_scan_reason(path, strict=True))
+
+    def test_real_path_resolving_to_protected_root_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            protected = os.path.join(td, "DatosProtegidos")
+            os.mkdir(protected)
+            link = os.path.join(td, "acceso_protegido")
+            if not self.create_directory_link(link, protected):
+                self.skipTest("El entorno no permite crear enlaces simbólicos ni junctions")
+
+            with patch.dict("Guardian.os.environ", {"ProgramData": protected}, clear=False), \
+                 patch("Guardian.os.walk") as walk, \
+                 patch("Guardian.os.stat") as stat, \
+                 patch("Guardian.os.scandir") as scandir:
+                events = self.scan(link)
+
+            walk.assert_not_called()
+            stat.assert_not_called()
+            scandir.assert_not_called()
+            result = self.single_result(events)
+            self.assertEqual(result.status, "error")
+            self.assertIn("Ruta bloqueada", result.evidence)
+            self.assertIn("directorio de datos de sistema", result.evidence)
+            self.assertEqual([d for k, d in events if k == "file_finding"], [])
+
+    def test_link_to_windows_root_is_rejected_before_traversal(self):
+        with tempfile.TemporaryDirectory() as td:
+            windows_root = os.environ.get("SystemRoot", r"C:\Windows")
+            link = os.path.join(td, "acceso_windows")
+            if not self.create_directory_link(link, windows_root):
+                self.skipTest("El entorno no permite crear enlaces simbólicos ni junctions")
+
+            with patch("Guardian.os.walk") as walk, \
+                 patch("Guardian.os.stat") as stat, \
+                 patch("Guardian.os.scandir") as scandir:
+                events = self.scan(link)
+
+            walk.assert_not_called()
+            stat.assert_not_called()
+            scandir.assert_not_called()
+            result = self.single_result(events)
+            self.assertEqual(result.status, "error")
+            self.assertIn("Ruta bloqueada", result.evidence)
+            self.assertIn("carpeta del sistema", result.evidence)
+
+    def test_similar_prefix_real_directory_remains_scanable(self):
+        with tempfile.TemporaryDirectory() as td:
+            system = os.path.join(td, "Windows")
+            backup = os.path.join(td, "WindowsBackup")
+            os.mkdir(system)
+            os.mkdir(backup)
+            self.touch(os.path.join(backup, "password.txt"))
+
+            with patch.dict("Guardian.os.environ", {"SystemRoot": system, "WINDIR": system}, clear=False):
+                self.assertEqual(self.app._protected_scan_reason(backup, strict=True), "")
+                events = self.scan(backup)
+
+            result = self.single_result(events)
+            findings = [data for kind, data in events if kind == "file_finding"]
+            self.assertEqual(result.status, "finding")
+            self.assertEqual(len(findings), 1)
+            self.assertIn("WindowsBackup", findings[0])
+
+    def test_unc_share_root_is_rejected_but_descendant_is_not(self):
+        def fake_realpath(path, *, strict=False):
+            return os.fspath(path)
+
+        with patch("Guardian.os.path.realpath", side_effect=fake_realpath), \
+             patch.dict("Guardian.os.environ", self.PROTECTED_ENV, clear=False):
+            reason = self.app._protected_scan_reason(r"\\servidor\recurso")
+            self.assertTrue(reason)
+            self.assertIn("recurso de red", reason)
+            self.assertEqual(
+                self.app._protected_scan_reason(r"\\servidor\recurso\carpeta"),
+                ""
+            )
+            self.assertTrue(
+                self.app._protected_scan_reason(r"\\?\UNC\servidor\recurso")
+            )
+            self.assertEqual(
+                self.app._protected_scan_reason(r"\\?\UNC\servidor\recurso\carpeta"),
+                ""
+            )
+
+    def test_extended_paths_are_recognized_and_device_volumes_fail_closed(self):
+        def fake_realpath(path, *, strict=False):
+            return os.fspath(path)
+
+        with patch("Guardian.os.path.realpath", side_effect=fake_realpath), \
+             patch.dict("Guardian.os.environ", self.PROTECTED_ENV, clear=False):
+            self.assertTrue(self.app._protected_scan_reason(r"\\?\C:\Windows"))
+            self.assertTrue(self.app._protected_scan_reason(r"\\.\C:\Windows"))
+            self.assertEqual(
+                self.app._normalize_path_for_compare(r"\\?\Volume{abc}\Windows"),
+                ""
+            )
+            self.assertEqual(
+                self.app._normalize_path_for_compare(r"\\.\Volume{abc}\Windows"),
+                ""
+            )
+            self.assertTrue(
+                self.app._protected_scan_reason(r"\\?\Volume{abc}\Windows", strict=True)
+            )
+
+    def test_path_resolution_error_fails_safely_before_walk(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.touch(os.path.join(td, "notas.txt"))
+            target = os.path.abspath(td)
+            real_realpath = os.path.realpath
+
+            def fake_realpath(path, *, strict=False):
+                if os.path.normcase(os.path.abspath(path)) == os.path.normcase(target):
+                    raise OSError("fallo simulado de resolución")
+                return real_realpath(path, strict=strict)
+
+            with patch("Guardian.os.path.realpath", side_effect=fake_realpath), \
+                 patch("Guardian.os.walk") as walk, \
+                 patch("Guardian.os.scandir") as scandir:
+                events = self.scan(td)
+
+            walk.assert_not_called()
+            scandir.assert_not_called()
+            result = self.single_result(events)
+            self.assertEqual(result.status, "error")
+            self.assertIn("No se pudo resolver", result.evidence)
+            self.assertIn("vuelva a iniciar", result.recommendation.lower())
+            self.assertEqual([d for k, d in events if k == "file_finding"], [])
+
+    def test_folder_dialog_rejects_unresolvable_selection(self):
+        original = self.app.selected_path
+        with tempfile.TemporaryDirectory() as td:
+            missing = os.path.join(td, "no_existe")
+            with patch("Guardian.filedialog.askdirectory", return_value=missing), \
+                 patch("Guardian.messagebox.showwarning") as warning:
+                self.app.elegir_carpeta()
+
+        self.assertEqual(self.app.selected_path, original)
+        warning.assert_called_once()
+        self.assertIn("no pudo resolver", warning.call_args.args[1].lower())
+
+    def test_folder_dialog_stores_canonical_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            with patch("Guardian.filedialog.askdirectory", return_value=td), \
+                 patch("Guardian.messagebox.showwarning") as warning:
+                self.app.elegir_carpeta()
+
+            warning.assert_not_called()
+            self.assertEqual(
+                os.path.normcase(self.app.selected_path),
+                os.path.normcase(os.path.realpath(td, strict=True))
+            )
 
     def test_protected_root_is_blocked_before_walk_or_stat(self):
         with patch.dict("Guardian.os.environ", self.PROTECTED_ENV, clear=False), \
@@ -599,6 +859,47 @@ class StateTests(GuardianGuiTestCase):
         self.start_audit_with_results(second)
         self.assertEqual([r.name for r in self.app.check_results], [r.name for r in second])
         self.assertFalse(self.app.audit_in_progress)
+
+    def test_unresolvable_path_audit_can_be_followed_by_another(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.touch(os.path.join(td, "notas.txt"))
+            target = os.path.abspath(td)
+            real_realpath = os.path.realpath
+
+            def fake_realpath(path, *, strict=False):
+                if os.path.normcase(os.path.abspath(path)) == os.path.normcase(target):
+                    raise OSError("fallo simulado de resolución")
+                return real_realpath(path, strict=strict)
+
+            def put(result):
+                def _put():
+                    self.app.result_queue.put(("result", result))
+                return _put
+
+            self.app.selected_path = td
+            with patch("Guardian.os.path.realpath", side_effect=fake_realpath), \
+                 patch.object(self.app, "_check_firewall", new=put(Guardian.CheckResult("Firewall", "ok", "ok"))), \
+                 patch.object(self.app, "_check_defender", new=put(Guardian.CheckResult("Defender", "ok", "ok"))), \
+                 patch.object(self.app, "_check_rdp", new=put(Guardian.CheckResult("RDP", "ok", "ok"))):
+                self.app.iniciar_auditoria()
+                self.wait_for_audit()
+
+            self.assertFalse(self.app.audit_in_progress)
+            file_results = [r for r in self.app.check_results if r.name == "Análisis de nombres de archivo"]
+            self.assertEqual(len(file_results), 1)
+            self.assertEqual(file_results[0].status, "error")
+            self.assertIn("No se pudo resolver", file_results[0].evidence)
+            self.assertEqual(str(self.app.btn_new_audit.cget("state")), "normal")
+
+            second = [
+                Guardian.CheckResult("Correcta", "ok"),
+                Guardian.CheckResult("Hallazgo", "finding"),
+                Guardian.CheckResult("Incierta", "unverifiable"),
+                Guardian.CheckResult("Error", "error"),
+            ]
+            self.start_audit_with_results(second)
+            self.assertEqual([r.name for r in self.app.check_results], [r.name for r in second])
+            self.assertFalse(self.app.audit_in_progress)
 
     def test_start_audit_resets_immediately_and_disables_new_audit(self):
         self.app.check_results = [Guardian.CheckResult("Viejo", "ok")]
@@ -1238,6 +1539,38 @@ class PdfTests(GuardianGuiTestCase):
             b"PRIVACIDAD",
             b"parcial",
             b"solo nombres, no contenido",
+        ):
+            self.assertIn(needle, data, f"Falta en el PDF: {needle!r}")
+
+    def test_pdf_represents_path_resolution_error_and_link_exclusion(self):
+        self.app.selected_path = r"C:\Datos\Prueba"
+        self.app.audit_timestamp = "25/10/2026 10:00:00"
+        self.app.check_results = [
+            Guardian.CheckResult(
+                "Análisis de nombres de archivo", "error",
+                r"No se pudo resolver la ruta seleccionada de forma segura: C:\Datos\Enlace",
+                "info",
+                "Seleccione una carpeta de usuario o una carpeta de pruebas y vuelva a iniciar la auditoría."
+            ),
+            Guardian.CheckResult(
+                "Análisis de nombres de archivo", "unverifiable",
+                "Revisados: 3 archivos | Sin coincidencias en lo revisado | "
+                "Análisis parcial: 1 enlace(s)/punto(s) de reanálisis excluido(s)",
+                "info",
+                "No se puede confirmar la ausencia de nombres sensibles. Los enlaces se "
+                "excluyeron para no salir del ámbito autorizado."
+            ),
+        ]
+
+        data = self._render_current_pdf()
+
+        for needle in (
+            b"ERROR",
+            b"NO VERIFICABLE",
+            b"No se pudo resolver",
+            b"enlace",
+            b"excluido",
+            b"autorizado",
         ):
             self.assertIn(needle, data, f"Falta en el PDF: {needle!r}")
 

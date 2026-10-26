@@ -255,8 +255,37 @@ class GuardianProMaster(ctk.CTk):
                 "Seleccione una carpeta de usuario o una carpeta de pruebas."
             )
             return
-        self.selected_path = ruta
-        self._append_log(f"[SISTEMA] Carpeta seleccionada: {ruta}")
+
+        resolved = self._resolve_real_path(ruta, strict=True)
+        if not resolved:
+            self._append_log(
+                f"[RECHAZADA] No se pudo resolver la carpeta seleccionada de forma segura: {ruta}.",
+                "error"
+            )
+            messagebox.showwarning(
+                "Carpeta no verificable",
+                f"Guardian Pro no pudo resolver la ruta seleccionada de forma segura:\n{ruta}\n\n"
+                "La carpeta no existe, no es accesible o contiene un enlace no verificable. "
+                "Seleccione una carpeta de usuario o una carpeta de pruebas."
+            )
+            return
+
+        protected_reason = self._protected_scan_reason(resolved)
+        if protected_reason:
+            self._append_log(
+                f"[RECHAZADA] La ruta real de {ruta} es {resolved}, que es {protected_reason}.",
+                "error"
+            )
+            messagebox.showwarning(
+                "Carpeta protegida",
+                f"Guardian Pro no analiza {ruta} porque su ruta real es {resolved} "
+                f"y corresponde a {protected_reason}.\n\n"
+                "Seleccione una carpeta de usuario o una carpeta de pruebas."
+            )
+            return
+
+        self.selected_path = resolved
+        self._append_log(f"[SISTEMA] Carpeta seleccionada: {resolved}")
 
     def _append_log(self, text: str, tag: str | None = None):
         """Añade texto al área de resultados (siempre desde el hilo principal)."""
@@ -344,27 +373,86 @@ class GuardianProMaster(ctk.CTk):
             return False
 
     @staticmethod
-    def _normalize_path_for_compare(path: str) -> str:
-        """Normaliza una ruta de Windows para comparaciones seguras."""
+    def _resolve_real_path(path: str, *, strict: bool = True) -> str:
+        """Devuelve la ruta real canónica conservando mayúsculas/minúsculas.
+
+        `os.path.realpath()` resuelve enlaces simbólicos y junctions de
+        Windows. Con `strict=True` la ruta debe existir y poder resolverse;
+        si no, se devuelve "" para que el llamador aplique un fallo seguro.
+        """
         if not path:
             return ""
         try:
             expanded = os.path.expandvars(os.path.expanduser(str(path)))
-            return os.path.normcase(os.path.normpath(os.path.abspath(expanded)))
-        except (OSError, ValueError):
+            resolved = os.path.realpath(expanded, strict=strict)
+            # GetFinalPathName puede devolver prefijos extendidos de Windows.
+            # Solo se aceptan formas que puedan compararse de forma segura:
+            # unidad con letra o UNC. Las rutas de volumen/GLOBALROOT/dispositivo
+            # no se consideran verificables y se rechazan.
+            if resolved.startswith("\\\\?\\UNC\\"):
+                resolved = "\\\\" + resolved[8:]
+            elif resolved.startswith("\\\\?\\"):
+                remainder = resolved[4:]
+                if len(remainder) >= 2 and remainder[1] == ":":
+                    resolved = remainder
+                else:
+                    return ""
+            elif resolved.startswith("\\\\.\\"):
+                remainder = resolved[4:]
+                if len(remainder) >= 2 and remainder[1] == ":":
+                    resolved = remainder
+                else:
+                    return ""
+            return os.path.normpath(os.path.abspath(resolved))
+        except (OSError, ValueError, RuntimeError):
             return ""
 
     @classmethod
-    def _protected_scan_reason(cls, path: str) -> str:
+    def _normalize_path_for_compare(cls, path: str, *, strict: bool = False) -> str:
+        """Resuelve una ruta y devuelve su clave de comparación.
+
+        La resolución usa `os.path.realpath()`, que resuelve enlaces
+        simbólicos y junctions. La clave final es insensible a mayúsculas y
+        usa separadores normalizados. Esta forma es solo para comparar; el
+        recorrido debe usar `_resolve_real_path()` para conservar la ruta real.
+        """
+        resolved = cls._resolve_real_path(path, strict=strict)
+        return os.path.normcase(resolved) if resolved else ""
+
+    @staticmethod
+    def _path_is_within(candidate: str, root: str) -> bool:
+        """Comprueba pertenencia usando límites de directorio, no prefijos."""
+        if not candidate or not root:
+            return False
+        boundary = root.rstrip("\\/") or root
+        return candidate == boundary or candidate.startswith(boundary + os.sep)
+
+    @staticmethod
+    def _is_reparse_or_link(path: str) -> bool:
+        """Detecta enlaces simbólicos, junctions y puntos de reanálisis.
+
+        Se usa `lstat` para no seguir el enlace. En Windows se consulta
+        `st_file_attributes`; en otros sistemas se comprueba `S_ISLNK`.
+        """
+        info = os.lstat(path)
+        if stat.S_ISLNK(info.st_mode):
+            return True
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        return bool(getattr(info, "st_file_attributes", 0) & reparse_flag)
+
+    @classmethod
+    def _protected_scan_reason(cls, path: str, *, strict: bool = False) -> str:
         """Devuelve el motivo por el que una raíz no debe escanearse, o ''."""
-        candidate = cls._normalize_path_for_compare(path)
+        candidate = cls._normalize_path_for_compare(path, strict=strict)
         if not candidate:
-            return ""
+            return "una ruta que no se pudo resolver de forma segura" if strict else ""
 
         drive, tail = os.path.splitdrive(candidate)
-        # Solo la raíz de la unidad es demasiado amplia; sus subcarpetas de
-        # usuario sí pueden analizarse.
-        if drive and not drive.startswith("\\\\") and tail in ("", os.sep):
+        # Una raíz completa de unidad o de recurso UNC es demasiado amplia;
+        # sus subcarpetas de usuario sí pueden analizarse.
+        if drive and tail in ("", os.sep):
+            if drive.startswith("\\\\"):
+                return f"la raíz completa del recurso de red {drive}"
             return f"la raíz completa de la unidad {drive}\\"
 
         env_roots = (
@@ -379,12 +467,18 @@ class GuardianProMaster(ctk.CTk):
             value = os.environ.get(env_name)
             if not value:
                 continue
-            root = cls._normalize_path_for_compare(value)
+            # Las raíces protegidas también se resuelven para cubrir el caso
+            # de una variable de entorno que apunte a un enlace o junction.
+            root = cls._normalize_path_for_compare(value, strict=True)
+            if not root:
+                # Si la raíz configurada no existe, no puede alcanzarse; se
+                # conserva una comparación léxica como defensa adicional.
+                root = cls._normalize_path_for_compare(value)
             if not root:
                 continue
-            # La comparación exige el separador de ruta para no confundir
-            # C:\Windows con C:\WindowsBackup.
-            if candidate == root or candidate.startswith(root + os.sep):
+            # El límite de directorio evita confundir C:\Windows con
+            # C:\WindowsBackup.
+            if cls._path_is_within(candidate, root):
                 return f"{label} {value}"
 
         return ""
@@ -981,6 +1075,8 @@ class GuardianProMaster(ctk.CTk):
         matches = 0
         walk_errors = []
         file_errors = []
+        scope_errors = []
+        link_skips = []
         root_path = self.selected_path
 
         def publish_result(status, evidence, recommendation, severity="info"):
@@ -993,9 +1089,17 @@ class GuardianProMaster(ctk.CTk):
                 can_fix=False
             )))
 
-        # Rechazar ubicaciones protegidas antes de cualquier acceso al sistema
-        # de archivos. Esto evita recorrer C:\Windows o una raíz de unidad.
-        protected_reason = self._protected_scan_reason(root_path) if root_path else ""
+        if not root_path:
+            publish_result(
+                "error",
+                "No se seleccionó una carpeta para el análisis de nombres.",
+                "Seleccione una carpeta válida."
+            )
+            return
+
+        # Rechazar ubicaciones protegidas antes del recorrido. Esto evita
+        # recorrer C:\Windows o una raíz de unidad.
+        protected_reason = self._protected_scan_reason(root_path)
         if protected_reason:
             publish_result(
                 "error",
@@ -1007,14 +1111,6 @@ class GuardianProMaster(ctk.CTk):
 
         # Validar la raíz antes de recorrer: distingue ruta inexistente,
         # archivo en lugar de carpeta y falta de permisos.
-        if not root_path:
-            publish_result(
-                "error",
-                "No se seleccionó una carpeta para el análisis de nombres.",
-                "Seleccione una carpeta válida."
-            )
-            return
-
         try:
             root_info = os.stat(root_path)
         except FileNotFoundError:
@@ -1047,6 +1143,35 @@ class GuardianProMaster(ctk.CTk):
             )
             return
 
+        # Resolver la ruta real antes de autorizar el recorrido. Si no se puede
+        # verificar, se falla de forma segura y no se presenta un OK vacío.
+        resolved_root = self._resolve_real_path(root_path, strict=True)
+        if not resolved_root:
+            publish_result(
+                "error",
+                f"No se pudo resolver la ruta seleccionada de forma segura: {root_path}. "
+                "La carpeta no existe, no es accesible o contiene un enlace no verificable.",
+                "Seleccione una carpeta de usuario o una carpeta de pruebas y vuelva a iniciar "
+                "la auditoría. No se recorrió la ubicación."
+            )
+            return
+
+        protected_reason = self._protected_scan_reason(resolved_root)
+        if protected_reason:
+            publish_result(
+                "error",
+                f"Ruta bloqueada tras resolver la ruta real: {root_path} -> {resolved_root} "
+                f"es {protected_reason}.",
+                "Seleccione una carpeta de usuario o una carpeta de pruebas. "
+                "No se recorrió la ubicación protegida ni se generaron hallazgos de archivos."
+            )
+            return
+
+        # El ámbito del recorrido es la ruta canónica ya validada. La clave
+        # normalizada se usa solo para comparaciones de pertenencia.
+        root_path = resolved_root
+        root_key = self._normalize_path_for_compare(root_path)
+
         try:
             # Abrir y cerrar el directorio comprueba el acceso sin leer nombres
             # ni contenidos de archivos.
@@ -1076,9 +1201,44 @@ class GuardianProMaster(ctk.CTk):
             for current_root, dirs, files in os.walk(
                 root_path, topdown=True, onerror=on_walk_error, followlinks=False
             ):
+                # Confirmar que el directorio entregado sigue dentro del ámbito
+                # canónico. Esto protege incluso si os.walk recibiera una ruta
+                # inesperada o si cambió un enlace durante el recorrido.
+                current_key = self._normalize_path_for_compare(current_root, strict=True)
+                if not current_key or not self._path_is_within(current_key, root_key):
+                    scope_errors.append(current_root)
+                    dirs[:] = []
+                    continue
+
                 # Excluir directorios modificando la lista in-place. Con
                 # topdown=True esto impide que os.walk descienda a ellos.
-                dirs[:] = [d for d in dirs if d.lower() not in exclude_dirs and not d.startswith('.')]
+                # Los enlaces simbólicos, junctions y puntos de reanálisis se
+                # excluyen siempre para no salir del árbol autorizado.
+                kept_dirs = []
+                for dirname in dirs:
+                    if dirname.lower() in exclude_dirs or dirname.startswith('.'):
+                        continue
+                    candidate = os.path.join(current_root, dirname)
+                    try:
+                        if self._is_reparse_or_link(candidate):
+                            link_skips.append(candidate)
+                            continue
+                    except OSError as exc:
+                        walk_errors.append((candidate, exc))
+                        continue
+
+                    resolved_dir_key = self._normalize_path_for_compare(candidate, strict=True)
+                    if not resolved_dir_key:
+                        walk_errors.append((candidate, OSError("no se pudo resolver el directorio")))
+                        continue
+                    if not self._path_is_within(resolved_dir_key, root_key):
+                        link_skips.append(candidate)
+                        continue
+                    if self._protected_scan_reason(candidate):
+                        link_skips.append(candidate)
+                        continue
+                    kept_dirs.append(dirname)
+                dirs[:] = kept_dirs
 
                 for file in files:
                     scanned += 1
@@ -1108,6 +1268,10 @@ class GuardianProMaster(ctk.CTk):
                 accumulated.append(f"{len(walk_errors)} directorio(s) no recorrido(s)")
             if file_errors:
                 accumulated.append(f"{len(file_errors)} archivo(s) con acceso no verificado")
+            if scope_errors:
+                accumulated.append(f"{len(scope_errors)} directorio(s) fuera del ámbito autorizado")
+            if link_skips:
+                accumulated.append(f"{len(link_skips)} enlace(s)/punto(s) de reanálisis excluido(s)")
             evidence = f"Error durante el recorrido: {exc} | Revisados: {scanned} | Coincidencias: {matches}"
             if accumulated:
                 evidence += " | " + "; ".join(accumulated)
@@ -1123,6 +1287,10 @@ class GuardianProMaster(ctk.CTk):
             error_parts.append(f"{len(walk_errors)} directorio(s) no recorrido(s)")
         if file_errors:
             error_parts.append(f"{len(file_errors)} archivo(s) con acceso no verificado")
+        if scope_errors:
+            error_parts.append(f"{len(scope_errors)} directorio(s) fuera del ámbito autorizado")
+        if link_skips:
+            error_parts.append(f"{len(link_skips)} enlace(s)/punto(s) de reanálisis excluido(s)")
         error_summary = "; ".join(error_parts)
         partial = bool(error_parts)
 
@@ -1136,6 +1304,11 @@ class GuardianProMaster(ctk.CTk):
             )
             if partial:
                 recommendation += " El análisis fue parcial; revise también los directorios o archivos no accesibles."
+            if link_skips:
+                recommendation += (
+                    " Los enlaces simbólicos, junctions y puntos de reanálisis se excluyeron "
+                    "para no salir del ámbito autorizado."
+                )
             publish_result(
                 "finding",
                 evidence,
@@ -1143,12 +1316,20 @@ class GuardianProMaster(ctk.CTk):
                 severity="low"
             )
         elif partial:
-            publish_result(
-                "unverifiable",
-                f"Revisados: {scanned} archivos | Sin coincidencias en lo revisado | Análisis parcial: {error_summary}",
+            recommendation = (
                 "No se puede confirmar la ausencia de nombres sensibles: hubo directorios o archivos "
                 "que no se pudieron revisar. Solo se examinaron nombres, no el contenido. "
                 "Ejecute Guardian Pro como administrador o seleccione una carpeta accesible."
+            )
+            if link_skips:
+                recommendation += (
+                    " Los enlaces simbólicos, junctions y puntos de reanálisis se excluyeron "
+                    "para no salir del ámbito autorizado."
+                )
+            publish_result(
+                "unverifiable",
+                f"Revisados: {scanned} archivos | Sin coincidencias en lo revisado | Análisis parcial: {error_summary}",
+                recommendation
             )
         else:
             publish_result(
